@@ -1,0 +1,16 @@
+# 统一行尾为 LF（与 .editorconfig / 编码守护一致），跨平台不产生 CRLF 抖动。
+* text=auto eol=lf
+
+# 二进制资源不做行尾/文本规范化。
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.webp binary
+*.pdf  binary
+*.docx binary
+*.pt   binary
+*.onnx binary
+*.zip  binary
+*.tar.gz binary

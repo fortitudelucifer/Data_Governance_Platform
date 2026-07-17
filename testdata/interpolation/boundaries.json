@@ -1,0 +1,15 @@
+{
+  "name": "boundaries",
+  "desc": "Before the first keyframe and after the last keyframe there is no geometry (no extrapolation). Exact endpoints are present.",
+  "keyframes": [
+    {"frame": 5,  "ts_ms": 200, "bbox": [0, 0, 10, 10],  "outside": false, "occluded": false},
+    {"frame": 15, "ts_ms": 600, "bbox": [40, 0, 10, 10], "outside": false, "occluded": false}
+  ],
+  "queries": [
+    {"frame": 4,  "ts_ms": 199, "present": false},
+    {"frame": 5,  "ts_ms": 200, "present": true,  "bbox": [0, 0, 10, 10]},
+    {"frame": 10, "ts_ms": 400, "present": true,  "bbox": [20, 0, 10, 10]},
+    {"frame": 15, "ts_ms": 600, "present": true,  "bbox": [40, 0, 10, 10]},
+    {"frame": 16, "ts_ms": 601, "present": false}
+  ]
+}

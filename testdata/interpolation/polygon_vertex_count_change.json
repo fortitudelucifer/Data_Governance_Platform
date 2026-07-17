@@ -1,0 +1,13 @@
+{
+  "name": "polygon_vertex_count_change",
+  "desc": "Vertex counts differ between keyframes (3-gon → 4-gon): there is no meaningful component-wise blend, so the segment HOLDS the start keyframe's geometry until the next keyframe. Matches lerpSlice's len(a)!=len(b) branch on both ends.",
+  "keyframes": [
+    {"frame": 0,  "ts_ms": 0,    "points": [0, 0, 10, 0, 10, 10],         "outside": false, "occluded": false},
+    {"frame": 30, "ts_ms": 1000, "points": [0, 0, 20, 0, 20, 20, 0, 20],  "outside": false, "occluded": false}
+  ],
+  "queries": [
+    {"frame": 0,  "ts_ms": 0,    "present": true, "points": [0, 0, 10, 0, 10, 10]},
+    {"frame": 15, "ts_ms": 500,  "present": true, "points": [0, 0, 10, 0, 10, 10]},
+    {"frame": 30, "ts_ms": 1000, "present": true, "points": [0, 0, 20, 0, 20, 20, 0, 20]}
+  ]
+}

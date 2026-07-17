@@ -1,0 +1,13 @@
+{
+  "name": "polygon_linear",
+  "desc": "Polygon (points) geometry interpolates component-wise, exactly like bbox. Covers the SAM2/mask track shape, which bbox-only fixtures never exercised.",
+  "keyframes": [
+    {"frame": 0,  "ts_ms": 0,    "points": [0, 0, 10, 0, 10, 10],     "outside": false, "occluded": false},
+    {"frame": 30, "ts_ms": 1000, "points": [100, 0, 110, 0, 110, 10], "outside": false, "occluded": false}
+  ],
+  "queries": [
+    {"frame": 0,  "ts_ms": 0,    "present": true, "points": [0, 0, 10, 0, 10, 10]},
+    {"frame": 15, "ts_ms": 500,  "present": true, "points": [50, 0, 60, 0, 60, 10]},
+    {"frame": 30, "ts_ms": 1000, "present": true, "points": [100, 0, 110, 0, 110, 10]}
+  ]
+}

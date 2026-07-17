@@ -1,0 +1,19 @@
+# 保持构建上下文精简：排除二进制 / 本地数据 / 日志（避免拷进镜像层）。
+*.exe
+*.exe~
+app_linux
+app_local.exe
+app_new.exe
+app_test.exe
+cmd.exe
+main.exe
+backfill_qa_answers.exe
+bin/
+data/
+storage/
+*.db
+*.db-shm
+*.db-wal
+*.log
+Dockerfile
+.dockerignore

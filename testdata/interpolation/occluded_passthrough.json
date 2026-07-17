@@ -1,0 +1,13 @@
+{
+  "name": "occluded_passthrough",
+  "desc": "occluded is passthrough state held from the segment's start keyframe; it never affects geometry.",
+  "keyframes": [
+    {"frame": 0,  "ts_ms": 0,    "bbox": [0, 0, 10, 10],   "outside": false, "occluded": false},
+    {"frame": 30, "ts_ms": 1000, "bbox": [100, 0, 10, 10], "outside": false, "occluded": true}
+  ],
+  "queries": [
+    {"frame": 0,  "ts_ms": 0,    "present": true, "bbox": [0, 0, 10, 10],   "occluded": false},
+    {"frame": 15, "ts_ms": 500,  "present": true, "bbox": [50, 0, 10, 10],  "occluded": false},
+    {"frame": 30, "ts_ms": 1000, "present": true, "bbox": [100, 0, 10, 10], "occluded": true}
+  ]
+}

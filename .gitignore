@@ -1,0 +1,114 @@
+# ── 依赖 / 构建产物 ──
+**/node_modules/
+**/dist/
+**/wailsjs/
+**/build/bin/
+**/__pycache__/
+*.pyc
+**/.venv/
+**/venv/
+.gocache/
+
+# ── 二进制 / 可执行 ──
+*.exe
+*.exe~
+backend/app_linux
+backend/bin/
+backend/build/
+app_linux_label_patch
+*.tar.gz
+*.zip
+
+# ── 日志 ──
+*.log
+logs/
+
+# ── 数据库 / 运行时数据（含用户 PII，绝不入库）──
+*.db
+*.db-shm
+*.db-wal
+*.db-*
+*.bak
+*.db.*.bak
+backend/storage/
+backend/data/
+
+# ── 数据集 / 验证集 / 临时（大 + 含本地/敏感数据）──
+# 只忽略仓库根的 dataset/（本地数据），不误伤 src 里名为 dataset 的组件目录。
+/dataset/
+validation_set/
+tmp/
+_rollback/
+
+# ── 模型权重 ──
+*.pt
+*.pth
+*.onnx
+
+# ── 媒体处理二进制（ffmpeg/ffprobe，~100MB）──
+# 不随仓库分发：自行 winget/apt install，或放 tools/bin/ 并用 MM_FFMPEG_PATH 指过去。
+tools/bin/
+tools/ffmpeg-*/
+tools/manual-shots/shots/
+
+# ── 本地密钥 / 环境（公开仓库：真实密钥永远不进 git）──
+.env
+.env.local
+scripts/secrets.local.ps1
+scripts/.jwt-secret.local
+scripts/.rotated-secrets.local.txt
+*.local.ps1
+!scripts/secrets.local.example.ps1
+
+# ── Playwright 产物 ──
+**/playwright-report/
+**/test-results/
+**/blob-report/
+**/.playwright/
+frontend/e2e/.e2e-state.json
+
+# ── 本地净环境自检目录（模拟 CI 的空库）──
+/.e2e-clean/
+
+# ── 编辑器 / 工具私有目录 ──
+.claude/
+.obsidian/
+.kiro/
+.codebuddy/
+.vscode/
+.idea/
+.DS_Store
+
+# ── 文档二进制导出（保留 .md，忽略 Word 导出）──
+*.docx
+
+# ── 本地一次性脚本 / 调研材料（不入库）──
+schema_180_current.sql
+MIGRATE_TO_103.md
+cleanup-admin.ps1
+cleanup-local-docker.ps1
+switch-to-103.ps1
+start-backend.ps1.localhost.bak
+deploy_step*.sh
+fix_server_temp_schema.sql
+server_temp_schema.sql
+gen_hash.go
+login_admin.json
+README.internal.local.md
+app_wrapper/frontend/package.json.md5
+
+# ══════════════════════════════════════════════════════════════════
+# 不进公开仓库 Data_Governance_Platform（永久排除；仅本地保留）
+# ══════════════════════════════════════════════════════════════════
+# 这些含大量内部规划 / 部署细节 / 103 运维，不适合放公开仓库。
+# 本地照常保留，只是 push 不带它们。接手说明（CLAUDE.md 的七条静默
+# bug 教训等）留在本地开发环境。
+/docs/
+/multi-modality/
+/deploy-to-103/
+/config/deploy/
+/CLAUDE.md
+/AGENT.md
+/CHANGELOG.md
+# README.md：旧那份（内部向）不推；仓库里的 README.md 是给公开仓库新写的极简版，要进。
+/deploy-to-103/

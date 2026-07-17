@@ -1,0 +1,12 @@
+{
+  "name": "single_keyframe",
+  "desc": "A track with one keyframe is present only at that exact ts — no extrapolation before or after.",
+  "keyframes": [
+    {"frame": 10, "ts_ms": 333, "bbox": [5, 5, 20, 20], "outside": false, "occluded": false}
+  ],
+  "queries": [
+    {"frame": 0,  "ts_ms": 0,    "present": false},
+    {"frame": 10, "ts_ms": 333,  "present": true, "bbox": [5, 5, 20, 20]},
+    {"frame": 40, "ts_ms": 1000, "present": false}
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "name": "vfr_nonuniform",
+  "desc": "Variable frame rate — non-uniform ts spacing. Interpolating by frame number would be wrong; ts_ms is authoritative.",
+  "keyframes": [
+    {"frame": 0,  "ts_ms": 0,    "bbox": [0, 0, 10, 10],   "outside": false, "occluded": false},
+    {"frame": 10, "ts_ms": 200,  "bbox": [20, 0, 10, 10],  "outside": false, "occluded": false},
+    {"frame": 40, "ts_ms": 2000, "bbox": [200, 0, 10, 10], "outside": false, "occluded": false}
+  ],
+  "queries": [
+    {"frame": 5,  "ts_ms": 100,  "present": true, "bbox": [10, 0, 10, 10]},
+    {"frame": 25, "ts_ms": 1100, "present": true, "bbox": [110, 0, 10, 10]},
+    {"frame": 10, "ts_ms": 200,  "present": true, "bbox": [20, 0, 10, 10]}
+  ]
+}

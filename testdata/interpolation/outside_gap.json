@@ -1,0 +1,16 @@
+{
+  "name": "outside_gap",
+  "desc": "visible → outside → visible. No transition across the outside boundary: the visible→outside segment holds the visible geometry; the outside keyframe and the following gap produce nothing until the object reappears.",
+  "keyframes": [
+    {"frame": 0,  "ts_ms": 0,    "bbox": [0, 0, 10, 10],   "outside": false, "occluded": false},
+    {"frame": 30, "ts_ms": 1000, "bbox": [100, 0, 10, 10], "outside": true,  "occluded": false},
+    {"frame": 60, "ts_ms": 2000, "bbox": [300, 0, 10, 10], "outside": false, "occluded": false}
+  ],
+  "queries": [
+    {"frame": 0,  "ts_ms": 0,    "present": true,  "bbox": [0, 0, 10, 10]},
+    {"frame": 15, "ts_ms": 500,  "present": true,  "bbox": [0, 0, 10, 10]},
+    {"frame": 30, "ts_ms": 1000, "present": false},
+    {"frame": 45, "ts_ms": 1500, "present": false},
+    {"frame": 60, "ts_ms": 2000, "present": true,  "bbox": [300, 0, 10, 10]}
+  ]
+}
