@@ -759,11 +759,20 @@ GitHub `origin`（`Data_Governance_Platform`）是**公开仓库**。发布走 *
   "migrate"会让人误以为是迁移遗留分支，其实它是从旧 Labelling 仓库重新 `init`
   的**再生根**，日常所有提交都在这）。它**从不 push**：几十上百条 WIP 历史 +
   任何中间敏感态都留在本地。
-- **公开 `main` = 单条 squash 快照**（现在就 1 个 commit）。发布 = 用
-  `git commit-tree "$(git rev-parse trunk^{tree})"` 把当前 tree 策展成**一条无父
-  快照 commit**（想先审就临时挂个分支看、审完即删，不留常驻 staging 分支），
-  `git push origin <sha>:main --force`，完事 `git branch -f main origin/main` 把本地
-  `main` 对齐。于是公开仓库历史里不会夹带密钥 / PHI / 真实数据路径 / 中间态。
+- **公开 `main` = 策展快照链**（每次发布**追加**一条 squash 快照；**2026-08-05 起从
+  "无父、每次 --force 顶掉" 改成 "有父、追加"**，让公开仓库有一条"每次发布一格"的
+  changelog。当前 `3287662` 是链根——它无父，之后的快照都挂在它后面）。发布 =
+  ```
+  git fetch origin main                                   # 拿到最新 origin/main 作父
+  SNAP=$(git commit-tree "$(git rev-parse 'trunk^{tree}')" -p origin/main -m "<发布说明>")
+  git push origin $SNAP:main                              # 有父 = 快进追加,不再 --force
+  git branch -f main origin/main                          # 对齐本地 main
+  ```
+  每条快照**仍是整树 squash**（一条 commit = 那次发布的完整 tree），所以公开历史里
+  依旧不夹带密钥 / PHI / 真实数据路径 / WIP 中间态——只是快照之间用父指针串成了链。
+  ⚠️ 必须先 `fetch` 再取 `origin/main` 作父,否则父指向陈旧 tip → push 被拒
+  (non-fast-forward)。想先审就临时挂个分支看、审完即删,不留常驻 staging 分支。
+  ⚠️ **仍绝不 push `trunk`**：改的是"公开那几条快照串成链",不是把 98 条 WIP 历史放出去。
 - **本地常驻两条分支**：`trunk`（私有全历史工作干，从不 push）+ `main`（镜像公开
   快照 `origin/main`，只在发布后对齐）。别再养 `public-main` / `public-snapshot` 之类
   的常驻 staging 分支——快照是 `commit-tree` 现搭现用、发完即弃的（2026-07-30 已把
