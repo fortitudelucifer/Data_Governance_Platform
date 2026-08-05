@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    name: 后端 (vet + build + test)
+    runs-on: ubuntu-latest
+    services:
+      # Postgres 集成测试（postgres_integration_test.go）在这里真跑一遍 goose 迁移，
+      # 并断言唯一约束/外键级联/并发去重恰一行——迁移文件不会腐烂成
+      # 「只在某台 dev 机器上验证过」。库是一次性的（测试会 DROP SCHEMA）。
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: data_governance_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.7'
+          cache-dependency-path: backend/go.sum
+      - run: go vet ./...
+      - run: go build ./...
+      # 依赖 MinIO 等外部服务的测试会自动 t.Skip；Postgres 由 service 容器提供。
+      - run: go test ./... -count=1
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/data_governance_test?sslmode=disable
+
+  frontend:
+    name: 前端 (lint + test + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      # 本仓库含跨平台原生依赖（@emnapi/oxide 等）：Windows 开发机生成的 lock 缺 Linux
+      # 平台条目，严格的 npm ci 在 Linux 上会 EUSAGE。改用 npm install（按平台解析、宽松）。
+      - run: npm install --no-audit --no-fund
+      - run: npm run lint
+      # 插值契约被实现了两遍：Go（导出器写进文件的框）和 TS（画布上标注员看到的
+      # 框）。两侧读**同一批** golden 夹具（仓库根 testdata/interpolation/），
+      # 任何一端漂移都会在这里挂 —— 在此之前 TS 那半边是裸奔的。
+      - run: npm test
+      - run: npm run build
+
+  # e2e：把真实后端 + Postgres + Redis 起在 runner 上，用 Playwright 跑主链路。
+  # 此前 e2e 只在开发机手动跑（还硬编码了那台机器上的 dataset/task ID），
+  # 于是它是「改完之后的自查」，不是「拦住别人改坏的回归网」。现在是了。
+  e2e:
+    name: e2e (Playwright · 真后端)
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports: ['6379:6379']
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: data_governance_e2e
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # 后端（空库；数据由 playwright globalSetup 按名字幂等播种）
+      APP_ENV: dev
+      JWT_SECRET: ci-e2e-not-a-production-secret
+      SERVER_PORT: ':8280'
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/data_governance_e2e?sslmode=disable
+      REDIS_URL: redis://localhost:6379/0
+      MM_OBJECT_STORE_DRIVER: local
+      MM_OBJECT_STORE_ROOT: /tmp/e2e-assets
+      # 视频要派生帧索引，否则工作台帧数为 0、跳帧全被 clamp 到 0
+      MM_MEDIA_WORKER_ENABLED: 'true'
+      MM_FFMPEG_PATH: /usr/bin/ffmpeg
+      MM_FFPROBE_PATH: /usr/bin/ffprobe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.7'
+          cache-dependency-path: backend/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # media-worker 靠 ffmpeg/ffprobe 出帧索引与缩略图
+      - name: 装 ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
+      - name: 起后端（空库，自动建 admin/admin123）
+        working-directory: backend
+        run: |
+          go build -o /tmp/app ./cmd
+          /tmp/app > /tmp/backend.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sf -o /dev/null http://127.0.0.1:8280/livez; then echo "backend up"; exit 0; fi
+            sleep 1
+          done
+          echo "::error::后端 60s 内没起来"; tail -50 /tmp/backend.log; exit 1
+
+      - name: 构建前端
+        working-directory: frontend
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+          npx playwright install --with-deps chromium
+
+      # globalSetup 先播种（建数据集/上传视频/等帧索引/建 track），再跑用例。
+      # webServer 会自动起 `npm run preview`（:4173，代理 /api → :8280）。
+      - name: 跑 e2e
+        working-directory: frontend
+        run: npx playwright test
+
+      - name: 失败时收集现场
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-failure
+          path: |
+            frontend/test-results/
+            frontend/e2e/.e2e-state.json
+            /tmp/backend.log
+          retention-days: 7

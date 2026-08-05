@@ -1,0 +1,70 @@
+{
+  "name": "cells_hold",
+  "desc": "Cells tracks (病理 C2) never interpolate: a keyframe carries a whole ROI's cells in instances[] (each = bbox + bbox-local RLE + class + score), and a segment touching an instances-bearing keyframe HOLDS the start keyframe wholesale. Dispatch is by geometry PRESENCE not kind — cells' rle is nested inside instances so the top-level rle/bbox are empty; without an explicit instances guard, InterpolateAt would fall into lerpGeom and silently drop every cell (CLAUDE.md #6). Mid-segment queries must return kf0's instances verbatim; the second keyframe takes over only at its own ts.",
+  "geometry_kinds": [
+    "cells"
+  ],
+  "keyframes": [
+    {
+      "frame": 0,
+      "ts_ms": 0,
+      "instances": [
+        { "bbox": [10, 10, 20, 20], "rle": { "size": [20, 20], "counts": "0f8Kd0" }, "class": "tumor", "score": 0.9 },
+        { "bbox": [40, 42, 15, 16], "rle": { "size": [16, 15], "counts": "3aP1b" }, "class": "immune", "score": 0.72 }
+      ],
+      "outside": false,
+      "occluded": false
+    },
+    {
+      "frame": 30,
+      "ts_ms": 1000,
+      "instances": [
+        { "bbox": [50, 30, 25, 25], "rle": { "size": [25, 25], "counts": "9zW21b" }, "class": "tumor", "score": 0.85 }
+      ],
+      "outside": false,
+      "occluded": false
+    }
+  ],
+  "queries": [
+    {
+      "frame": 0,
+      "ts_ms": 0,
+      "present": true,
+      "instances": [
+        { "bbox": [10, 10, 20, 20], "rle": { "size": [20, 20], "counts": "0f8Kd0" }, "class": "tumor", "score": 0.9 },
+        { "bbox": [40, 42, 15, 16], "rle": { "size": [16, 15], "counts": "3aP1b" }, "class": "immune", "score": 0.72 }
+      ]
+    },
+    {
+      "frame": 15,
+      "ts_ms": 500,
+      "present": true,
+      "instances": [
+        { "bbox": [10, 10, 20, 20], "rle": { "size": [20, 20], "counts": "0f8Kd0" }, "class": "tumor", "score": 0.9 },
+        { "bbox": [40, 42, 15, 16], "rle": { "size": [16, 15], "counts": "3aP1b" }, "class": "immune", "score": 0.72 }
+      ]
+    },
+    {
+      "frame": 29,
+      "ts_ms": 966,
+      "present": true,
+      "instances": [
+        { "bbox": [10, 10, 20, 20], "rle": { "size": [20, 20], "counts": "0f8Kd0" }, "class": "tumor", "score": 0.9 },
+        { "bbox": [40, 42, 15, 16], "rle": { "size": [16, 15], "counts": "3aP1b" }, "class": "immune", "score": 0.72 }
+      ]
+    },
+    {
+      "frame": 30,
+      "ts_ms": 1000,
+      "present": true,
+      "instances": [
+        { "bbox": [50, 30, 25, 25], "rle": { "size": [25, 25], "counts": "9zW21b" }, "class": "tumor", "score": 0.85 }
+      ]
+    },
+    {
+      "frame": 31,
+      "ts_ms": 1033,
+      "present": false
+    }
+  ]
+}

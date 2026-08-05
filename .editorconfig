@@ -1,0 +1,45 @@
+# EditorConfig — https://editorconfig.org
+# 本文件是此仓库的编码权威声明。
+# 所有支持 EditorConfig 的编辑器（VS Code、JetBrains、Sublime Text、
+# Vim/Neovim 装插件后、Emacs）会强制以 UTF-8（无 BOM）打开并保存文件，
+# 不会触发 GBK / GB2312 自动检测。
+#
+# ── 能防住的场景 ───────────────────────────────────────────────
+# · VS Code / JetBrains / Sublime 等主流编辑器的"自动检测编码"导致的写坏
+# · 因编辑器默认编码设为 GBK 而保存出错的情况
+# · root = true 阻止编辑器向父目录继续查找其他 .editorconfig，
+#   确保本声明是终点，不被外层配置覆盖
+#
+# ── 防不住的场景 ───────────────────────────────────────────────
+# · Windows 记事本（Notepad）：不支持 EditorConfig，打开时仍可能乱改编码
+# · 命令行工具（cp / mv / cat 重定向）：绕过编辑器，不受本文件约束
+# · Python / 其他脚本用错误的 open(f, encoding='gbk') 读写文件
+#
+# ── 推荐的额外保险 ─────────────────────────────────────────────
+# 可在 .git/hooks/pre-commit 中调用一个乱码扫描脚本（检测 GBK 误解码
+# 产生的替换字符/乱码序列），检出即拒绝提交：
+#
+#   #!/bin/sh
+#   python scan_mojibake.py backend/
+#   if [ $? -ne 0 ]; then
+#     echo "❌ 提交中止：检测到 GBK 乱码字符，请先修复再提交"
+#     exit 1
+#   fi
+#
+# 这才是硬性拦截，不依赖编辑器是否遵守 EditorConfig。
+# ──────────────────────────────────────────────────────────────
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.go]
+indent_style = tab
+
+[*.{json,yaml,yml,toml,md}]
+indent_style = space
+indent_size = 2

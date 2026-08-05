@@ -1,0 +1,130 @@
+{
+  "name": "rle_hold",
+  "desc": "Dense masks never interpolate (00 contract rule 5 / plan-04 §4.3): a segment touching an rle-bearing keyframe HOLDS the start keyframe wholesale — bbox included, because the RLE is bbox-local and lerping the anchor box while holding the mask would silently misalign them. Mid-segment queries must return kf0's bbox AND rle verbatim; the second keyframe takes over only at its own ts.",
+  "geometry_kinds": [
+    "voxel_mask"
+  ],
+  "keyframes": [
+    {
+      "frame": 0,
+      "ts_ms": 0,
+      "bbox": [
+        10,
+        10,
+        40,
+        20
+      ],
+      "rle": {
+        "size": [
+          20,
+          40
+        ],
+        "counts": "0f8Kd0"
+      },
+      "outside": false,
+      "occluded": false
+    },
+    {
+      "frame": 30,
+      "ts_ms": 1000,
+      "bbox": [
+        50,
+        30,
+        60,
+        40
+      ],
+      "rle": {
+        "size": [
+          40,
+          60
+        ],
+        "counts": "9zW21b"
+      },
+      "outside": false,
+      "occluded": true
+    }
+  ],
+  "queries": [
+    {
+      "frame": 0,
+      "ts_ms": 0,
+      "present": true,
+      "bbox": [
+        10,
+        10,
+        40,
+        20
+      ],
+      "rle": {
+        "size": [
+          20,
+          40
+        ],
+        "counts": "0f8Kd0"
+      },
+      "occluded": false
+    },
+    {
+      "frame": 15,
+      "ts_ms": 500,
+      "present": true,
+      "bbox": [
+        10,
+        10,
+        40,
+        20
+      ],
+      "rle": {
+        "size": [
+          20,
+          40
+        ],
+        "counts": "0f8Kd0"
+      },
+      "occluded": false
+    },
+    {
+      "frame": 29,
+      "ts_ms": 966,
+      "present": true,
+      "bbox": [
+        10,
+        10,
+        40,
+        20
+      ],
+      "rle": {
+        "size": [
+          20,
+          40
+        ],
+        "counts": "0f8Kd0"
+      },
+      "occluded": false
+    },
+    {
+      "frame": 30,
+      "ts_ms": 1000,
+      "present": true,
+      "bbox": [
+        50,
+        30,
+        60,
+        40
+      ],
+      "rle": {
+        "size": [
+          40,
+          60
+        ],
+        "counts": "9zW21b"
+      },
+      "occluded": true
+    },
+    {
+      "frame": 31,
+      "ts_ms": 1033,
+      "present": false
+    }
+  ]
+}

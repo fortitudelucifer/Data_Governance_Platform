@@ -1,0 +1,34 @@
+model_list:
+  # NOTE: 本 DashScope 账号仅开通了稳定版模型名，未开通 *-latest 快照别名
+  # （qwen-vl-max-latest / qwen-vl-plus-latest 会返回 403 access_denied）。
+  # 因此统一指向稳定版 qwen-vl-max / qwen-vl-plus，切勿改回 -latest。
+  - model_name: qwen-vl
+    litellm_params:
+      model: openai/qwen-vl-max
+      api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+      api_key: os.environ/DASHSCOPE_API_KEY
+  # A/B 对比组：max（强/贵）vs plus（快/便宜），同一个 DashScope key。
+  - model_name: qwen-vl-max
+    litellm_params:
+      model: openai/qwen-vl-max
+      api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+      api_key: os.environ/DASHSCOPE_API_KEY
+  - model_name: qwen-vl-plus
+    litellm_params:
+      model: openai/qwen-vl-plus
+      api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+      api_key: os.environ/DASHSCOPE_API_KEY
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+  # 主模型调用失败（限流/5xx/单点不可用）时自动降级到稳定的 qwen-vl-plus，
+  # 避免单点故障导致整批任务无 AI 产出。plus 自身作为基线无 fallback。
+  fallbacks:
+    - {"qwen-vl": ["qwen-vl-plus"]}
+    - {"qwen-vl-max": ["qwen-vl-plus"]}
+
+general_settings:
+  # 公开仓库：master key 绝不写进文件。容器启动时注入环境变量
+  # LITELLM_MASTER_KEY（与后端的 MM_LITELLM_API_KEY 必须一致）。
+  master_key: os.environ/LITELLM_MASTER_KEY
