@@ -169,6 +169,7 @@ func (w *MediaWorker) process(ctx context.Context, a *dbmodel.Asset) {
 		if r := recover(); r != nil {
 			slog.Error("media_worker panic recovered", "asset_id", a.ID, "panic", r)
 			_ = w.db.MarkPreprocessRejected(ctx, a.ID, fmt.Sprintf("panic during derive: %v", r))
+			_ = w.db.MarkTasksQCFailedByAsset(ctx, a.ID, "preprocess panic") // #10 任务转 QC_FAILED
 		}
 	}()
 	if err := w.derive(ctx, a); err != nil {
@@ -176,11 +177,15 @@ func (w *MediaWorker) process(ctx context.Context, a *dbmodel.Asset) {
 		if errors.As(err, &term) {
 			slog.Warn("media_worker rejected (terminal)", "asset_id", a.ID, "reason", term.reason)
 			_ = w.db.MarkPreprocessRejected(ctx, a.ID, term.reason) // status=rejected, never re-claimed
+			// #10 预处理终止失败必须撤销任务:否则任务(建时 qc_status=passed)仍可领取,
+			// 标注员领到一个"永远派生不出来"的坏资产任务。转 QC_FAILED,不再可领。
+			_ = w.db.MarkTasksQCFailedByAsset(ctx, a.ID, term.reason)
 			return
 		}
 		slog.Error("media_worker derive failed", "asset_id", a.ID, "attempt", a.PreprocessAttempts, "error", err)
 		if a.PreprocessAttempts >= w.cfg.MaxRetries {
 			_ = w.db.MarkPreprocessFailed(ctx, a.ID, err.Error(), nil) // terminal
+			_ = w.db.MarkTasksQCFailedByAsset(ctx, a.ID, err.Error())  // #10 重试耗尽也撤销任务
 			return
 		}
 		backoff := time.Duration(a.PreprocessAttempts) * 30 * time.Second
@@ -217,7 +222,12 @@ func (w *MediaWorker) derive(ctx context.Context, a *dbmodel.Asset) error {
 	if err != nil {
 		return err
 	}
-	_ = w.db.UpdateAssetMediaMeta(ctx, a.ID, meta.DurationMs, meta.FPS, meta.SampleRate, meta.Width, meta.Height)
+	// #12 元数据(旋转后的宽高/FPS/时长)写库失败**不能吞**。旧代码 `_=` 丢掉错误,派生
+	// 若随后成功,资产就永久停在 ready + 0/旧尺寸——导出归一化随即除零或漏标。让本次
+	// derive 失败重试,而不是产出一个"看着 ready、尺寸却是 0"的资产。
+	if err := w.db.UpdateAssetMediaMeta(ctx, a.ID, meta.DurationMs, meta.FPS, meta.SampleRate, meta.Width, meta.Height); err != nil {
+		return fmt.Errorf("write media meta: %w", err)
+	}
 
 	switch a.Modality {
 	case dbmodel.ModalityAudio:
@@ -252,9 +262,15 @@ func (w *MediaWorker) derive(ctx context.Context, a *dbmodel.Asset) error {
 			playSrc = tpath
 			// Re-probe the transcoded stream: rotation is baked in (→0), dims
 			// may swap, and pts come from the new stream.
-			if pm, perr := w.tools.Probe(ctx, tpath); perr == nil {
-				playMeta = pm
-				_ = w.db.UpdateAssetMediaMeta(ctx, a.ID, pm.DurationMs, pm.FPS, pm.SampleRate, pm.Width, pm.Height)
+			// #12 re-probe **失败不得用源流元数据冒充播放流**(源的旋转/尺寸与转码后不同,
+			// 帧↔时间会错);写库失败同样让 derive 失败重试,不产出错元数据。
+			pm, perr := w.tools.Probe(ctx, tpath)
+			if perr != nil {
+				return fmt.Errorf("re-probe transcoded stream: %w", perr)
+			}
+			playMeta = pm
+			if err := w.db.UpdateAssetMediaMeta(ctx, a.ID, pm.DurationMs, pm.FPS, pm.SampleRate, pm.Width, pm.Height); err != nil {
+				return fmt.Errorf("write transcoded media meta: %w", err)
 			}
 			playMeta.Playback = true
 			slog.Info("media_worker transcoded to playable", "asset_id", a.ID, "from_codec", meta.VideoCodec)

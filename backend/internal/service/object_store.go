@@ -38,6 +38,12 @@ type ObjectStore interface {
 	// nil.
 	Delete(ctx context.Context, storageURI string) error
 
+	// DeletePrefix removes **every** object under a prefix storageURI (one ending
+	// in "/"), e.g. a volume_slices/ directory of per-slice PNGs (#18). Plain
+	// Delete on a prefix is a no-op on MinIO and fails on a non-empty local dir,
+	// so the whole subtree would leak. Idempotent: a missing prefix returns nil.
+	DeletePrefix(ctx context.Context, prefixURI string) error
+
 	// Exists reports whether the object is present.
 	Exists(ctx context.Context, storageURI string) (bool, error)
 

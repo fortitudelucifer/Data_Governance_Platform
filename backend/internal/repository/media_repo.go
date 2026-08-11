@@ -35,9 +35,21 @@ func (r *DB) LeaseDuePreprocessAssets(ctx context.Context, leaseUntil time.Time,
 				Select("id").
 				Where("modality IN ?", dbmodel.PreprocessModalities()).
 				Where("qc_status = ?", dbmodel.QCStatusPassed).
-				Where("preprocess_status IN ?", []string{dbmodel.PreprocessPending, dbmodel.PreprocessFailed}).
-				Where("(preprocess_next_attempt_at IS NULL OR preprocess_next_attempt_at <= ?)", now).
-				Where("(preprocess_lease_until IS NULL OR preprocess_lease_until <= ?)", now).
+				// #11 认领集三条,分别修两个漏洞:
+				//  · pending:租约到期/从未租(NULL)可领。
+				//  · running:worker **崩溃后卡在 running**——旧查询只认 pending/failed,租约
+				//    过期也不重领,资产永久卡死。显式认领"running 且租约过期"。
+				//  · failed:**必须 next_attempt_at IS NOT NULL** 才领。旧查询把 NULL 当"立即
+				//    到期",而 MaxRetries 后的终止失败正是写 failed+next_at=NULL → 被当立即
+				//    到期无限无退避重试。带 next_at 的才是"排了退避重试"的,才领。
+				Where(`(
+					(preprocess_status = ? AND (preprocess_lease_until IS NULL OR preprocess_lease_until <= ?))
+					OR (preprocess_status = ? AND preprocess_lease_until IS NOT NULL AND preprocess_lease_until <= ?)
+					OR (preprocess_status = ? AND preprocess_next_attempt_at IS NOT NULL AND preprocess_next_attempt_at <= ? AND (preprocess_lease_until IS NULL OR preprocess_lease_until <= ?))
+				)`,
+					dbmodel.PreprocessPending, now,
+					dbmodel.PreprocessRunning, now,
+					dbmodel.PreprocessFailed, now, now).
 				Order("id asc").
 				Limit(limit)
 		}

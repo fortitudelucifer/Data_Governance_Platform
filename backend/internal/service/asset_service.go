@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 	"time"
 
 	"text-annotation-platform/internal/cache"
@@ -91,18 +92,30 @@ func (s *AssetService) DeleteAsset(ctx context.Context, id uint) error {
 	if err := s.db.DeleteMultiModalByAsset(ctx, id, taskIDs); err != nil {
 		return fmt.Errorf("payload cleanup: %w", err)
 	}
-	// Only touch blobs if no other asset references the same content hash.
-	shared := false
-	if n, e := s.db.CountAssetsBySHA256Except(ctx, asset.SHA256, id); e == nil && n > 0 {
-		shared = true
+	// #16 源 blob 按**精确 storage_uri** 引用计数(不是全局 SHA)。源键含 dataset id,
+	// 同字节跨数据集是不同 URI;全局 SHA 会漏删自己的 blob、或被空 URI 的 QC_FAILED 行挡住。
+	// **查询出错必须中止删除**——宁可不删也不能瞎猜(猜错就是删掉别人还在用的 blob)。
+	sharedSource := false
+	if asset.StorageURI != "" {
+		n, e := s.db.CountAssetsByStorageURIExcept(ctx, asset.StorageURI, id)
+		if e != nil {
+			return fmt.Errorf("source blob refcount: %w", e)
+		}
+		sharedSource = n > 0
 	}
-	// Derivative blobs (share the sha-addressed path) + rows.
+	// 派生物 blob 是**本资产专属**(路径含 dataset/asset/kind,不跨资产共享)→ 无条件删,
+	// 不受源 SHA 是否共享影响(旧代码源 SHA 一共享就连本资产的派生物一起漏删)。#18:前缀
+	// 型派生物(volume_slices/ 等,URI 以 / 结尾)必须 DeletePrefix 删整棵子树,单对象 Delete
+	// 删不掉目录里的 PNG,整卷切片会永久残留。
 	if derivs, e := s.db.ListDerivatives(ctx, id); e == nil {
-		if !shared {
-			for _, d := range derivs {
-				if d.StorageURI != "" {
-					_ = s.store.Delete(ctx, d.StorageURI) // best-effort
-				}
+		for _, d := range derivs {
+			if d.StorageURI == "" {
+				continue
+			}
+			if strings.HasSuffix(d.StorageURI, "/") {
+				_ = s.store.DeletePrefix(ctx, d.StorageURI) // #18 前缀:删整棵
+			} else {
+				_ = s.store.Delete(ctx, d.StorageURI)
 			}
 		}
 	}
@@ -113,19 +126,18 @@ func (s *AssetService) DeleteAsset(ctx context.Context, id uint) error {
 	if err := s.db.DeleteAnnotationTasksByAsset(ctx, id); err != nil {
 		return fmt.Errorf("delete tasks: %w", err)
 	}
-	// Source blob (guarded) + cache.
-	if !shared && asset.StorageURI != "" {
+	// Source blob (guarded by exact-URI refcount).
+	if !sharedSource && asset.StorageURI != "" {
 		_ = s.store.Delete(ctx, asset.StorageURI) // best-effort (may be locked mid-preprocess)
-	}
-	if s.cache != nil {
-		// 只剩 asset:{id}（GetAsset 的元数据缓存，有 TTL）。SHA256 去重缓存已整个
-		// 拿掉——去重只问数据库，所以删资产时不再有「幽灵键」需要一并清理。
-		// 老 Redis 库里残留的 asset:sha256:* 键已无人读取，是惰性垃圾。
-		s.cache.Delete(ctx, "asset:"+strconv.FormatUint(uint64(id), 10))
 	}
 	// Asset row last.
 	if err := s.db.DeleteAsset(ctx, id); err != nil {
 		return fmt.Errorf("delete asset row: %w", err)
+	}
+	// #13 缓存失效放在**删行之后**——旧代码先清缓存再删行,并发 GET 会把即将删除的
+	// 资产重新填回缓存,留下一个"库里没有、缓存有"的幽灵。提交后再清一次,窗口最小化。
+	if s.cache != nil {
+		s.cache.Delete(ctx, "asset:"+strconv.FormatUint(uint64(id), 10))
 	}
 	return nil
 }
@@ -192,6 +204,13 @@ func (s *AssetService) UploadImage(ctx context.Context, body io.Reader, opts Upl
 	report, clean, err := s.qc.Inspect(body, opts.DeclaredMIME)
 	if err != nil {
 		return nil, err
+	}
+	// #5 内容种类必须与数据集模态匹配。旧代码无条件按 ds.Modality 入库:PNG 传进 video
+	// 数据集会被当 video 处理(错误的预处理/零尺寸/错误任务路由)。magic 识别出的种类
+	// (image/volume/wsi 可靠)与模态不符即拒;音视频 magic 覆盖不全的由 worker 的 ffprobe
+	// 再验(canonical kind)。放行的失败态资产仍要挡住这种路由错误,所以在入库前就查。
+	if cerr := checkModalityMIME(ds.Modality, report.MIME); cerr != nil {
+		return nil, cerr
 	}
 
 	// SHA256 dedup. If an asset row already exists with the same SHA in the
@@ -297,9 +316,14 @@ func (s *AssetService) UploadImage(ctx context.Context, body io.Reader, opts Upl
 	return res, nil
 }
 
-// GetAsset returns the asset row by id.
-// Result is cached under "asset:{id}" for 60 minutes; assets are immutable
-// once uploaded (content-addressed via SHA256).
+// GetAsset returns the asset row by id, caching under "asset:{id}" for
+// assetMetaTTL — but **only once the asset is settled** (#13).
+//
+// ⚠️ 资产**不是**上传即不可变的(旧注释是假注释):宽高/preprocess_status/qc_status 在
+// 上传后还会被 media worker 改。首次 GET 若在 pending(0 尺寸)时把整行缓存 1 小时,worker
+// 随后改成 ready+真尺寸,GET 仍返回 0 尺寸整整一小时 → 下游归一化除零。所以只缓存**已
+// 定型**的资产:需预处理的模态要 preprocess ready,不需预处理的(image/text,dims 在 QC
+// 就出)上传即定型。删除时的缓存失效见 DeleteAsset(删行之后再清)。
 func (s *AssetService) GetAsset(ctx context.Context, id uint) (*dbmodel.Asset, error) {
 	key := "asset:" + strconv.FormatUint(uint64(id), 10)
 	if s.cache != nil {
@@ -312,10 +336,20 @@ func (s *AssetService) GetAsset(ctx context.Context, id uint) (*dbmodel.Asset, e
 	if err != nil {
 		return nil, err
 	}
-	if s.cache != nil {
+	if s.cache != nil && assetSettled(asset) {
 		s.cache.SetJSON(ctx, key, asset, assetMetaTTL)
 	}
 	return asset, nil
+}
+
+// assetSettled reports whether an asset's cacheable fields have stopped changing.
+func assetSettled(a *dbmodel.Asset) bool {
+	for _, m := range dbmodel.PreprocessModalities() {
+		if a.Modality == m {
+			return a.PreprocessStatus == dbmodel.PreprocessReady
+		}
+	}
+	return true // image/text: 无预处理,dims 在 QC 就定型
 }
 
 // ListAssets returns paginated assets.

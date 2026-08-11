@@ -219,6 +219,20 @@ func (s *LocalObjectStore) Delete(ctx context.Context, storageURI string) error 
 	return nil
 }
 
+// DeletePrefix implements ObjectStore (#18): remove the whole directory subtree.
+// os.Remove (single Delete) fails on a non-empty dir → volume_slices/ 的整棵 PNG
+// 会残留;RemoveAll 递归删。
+func (s *LocalObjectStore) DeletePrefix(ctx context.Context, prefixURI string) error {
+	abs, err := s.uriToAbs(prefixURI)
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(abs); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("delete prefix: %w", err)
+	}
+	return nil
+}
+
 // Exists implements ObjectStore.
 func (s *LocalObjectStore) Exists(ctx context.Context, storageURI string) (bool, error) {
 	abs, err := s.uriToAbs(storageURI)

@@ -29,6 +29,25 @@ func (r *DB) UpdateUploadSession(ctx context.Context, sessionID string, updates 
 		Where("session_id = ?", sessionID).Updates(updates).Error
 }
 
+// CASUploadSessionStatus atomically flips a session's status from expected→next
+// (plus optional extra updates), returning whether the row matched (#3). This
+// serialises concurrent Complete calls: only the caller that wins
+// pending→completing proceeds; the loser gets applied=false instead of both
+// racing on the same pending session and one poisoning the other's result.
+func (r *DB) CASUploadSessionStatus(ctx context.Context, sessionID, expected, next string, extra map[string]interface{}) (bool, error) {
+	updates := map[string]interface{}{"status": next}
+	for k, v := range extra {
+		updates[k] = v
+	}
+	res := r.DB.WithContext(ctx).Model(&dbmodel.UploadSession{}).
+		Where("session_id = ? AND status = ?", sessionID, expected).
+		Updates(updates)
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected == 1, nil
+}
+
 // ListReclaimableUploadSessions returns pending sessions whose lease/expiry has
 // elapsed — candidates for abort + temp cleanup by the janitor.
 func (r *DB) ListReclaimableUploadSessions(ctx context.Context, now time.Time, limit int) ([]dbmodel.UploadSession, error) {

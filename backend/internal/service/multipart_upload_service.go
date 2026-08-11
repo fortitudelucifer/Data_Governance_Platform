@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -200,6 +201,16 @@ func (s *MultipartUploadService) Complete(ctx context.Context, userID uint, sess
 	if len(parts) == 0 {
 		return nil, errors.New("no parts")
 	}
+	// #3 原子认领 pending→completing。并发两个 Complete 里只有一个能翻成 completing,
+	// 另一个 claimed=false 直接退出——不会两个都读到 pending 各跑一遍、其中一个注册成功
+	// 另一个 NoSuchUpload 后又把会话反写成 failed。此后所有分支都在 completing 态里跑。
+	claimed, cerr := s.db.CASUploadSessionStatus(ctx, sessionID, dbmodel.UploadPending, dbmodel.UploadCompleting, nil)
+	if cerr != nil {
+		return nil, cerr
+	}
+	if !claimed {
+		return nil, errors.New("session not pending or a completion is already in progress")
+	}
 
 	if err := s.store.CompleteMultipart(ctx, sess.TempObjectKey, sess.UploadID, parts); err != nil {
 		s.fail(ctx, sess, "complete multipart: "+err.Error())
@@ -209,6 +220,19 @@ func (s *MultipartUploadService) Complete(ctx context.Context, userID uint, sess
 	if err != nil {
 		s.fail(ctx, sess, "hash stream: "+err.Error())
 		return nil, fmt.Errorf("hash stream: %w", err)
+	}
+	// #2 服务端**实测大小**必须等于 Init 声明、且不超上限。旧代码拿到真实 size 却从不
+	// 比对 → 声明 100MiB 只交一个 16MiB part(截断文件)照样通过;声明小文件却上传超大
+	// part 可绕过 50GiB 上限。声明大小是 Init 算分片数的依据,实测不符即数据不完整/在钻空子。
+	if size != sess.SizeBytes {
+		_ = s.store.DeleteKey(ctx, sess.TempObjectKey)
+		s.fail(ctx, sess, fmt.Sprintf("size mismatch: assembled %d != declared %d", size, sess.SizeBytes))
+		return nil, fmt.Errorf("分片组装后大小 %d 与 Init 声明的 %d 不符(截断或不完整)", size, sess.SizeBytes)
+	}
+	if s.cfg.MaxSize > 0 && size > s.cfg.MaxSize {
+		_ = s.store.DeleteKey(ctx, sess.TempObjectKey)
+		s.fail(ctx, sess, fmt.Sprintf("size %d exceeds max %d", size, s.cfg.MaxSize))
+		return nil, fmt.Errorf("文件大小 %d 超过上限 %d", size, s.cfg.MaxSize)
 	}
 	if clientSHA == "" {
 		clientSHA = sess.ClientSHA256
@@ -249,13 +273,16 @@ func (s *MultipartUploadService) Complete(ctx context.Context, userID uint, sess
 		return nil, err
 	}
 	now := time.Now()
-	_ = s.db.UpdateUploadSession(ctx, sessionID, map[string]interface{}{
-		"status":           dbmodel.UploadCompleted,
+	// #3 completing→completed(CAS,不无条件反写);写失败不再静默吞:资产已注册(SHA
+	// 去重幂等),会话状态只是元数据,记日志即可,但绝不谎报失败。
+	if _, uerr := s.db.CASUploadSessionStatus(ctx, sessionID, dbmodel.UploadCompleting, dbmodel.UploadCompleted, map[string]interface{}{
 		"server_sha256":    sha,
 		"final_object_key": finalKey,
 		"asset_id":         res.Asset.ID,
 		"completed_at":     &now,
-	})
+	}); uerr != nil {
+		slog.Error("multipart: mark session completed failed (asset already registered)", "session", sessionID, "error", uerr)
+	}
 	return res, nil
 }
 
@@ -285,9 +312,9 @@ func (s *MultipartUploadService) ownedSession(ctx context.Context, userID uint, 
 }
 
 func (s *MultipartUploadService) fail(ctx context.Context, sess *dbmodel.UploadSession, msg string) {
-	_ = s.db.UpdateUploadSession(ctx, sess.SessionID, map[string]interface{}{
-		"status": dbmodel.UploadFailed, "error": msg,
-	})
+	// #3 只从 completing 反写 failed(CAS),绝不无条件覆盖——否则一次晚到的失败会把已
+	// completed 的会话反写成 failed。所有 fail() 调用点都在认领 completing 之后。
+	_, _ = s.db.CASUploadSessionStatus(ctx, sess.SessionID, dbmodel.UploadCompleting, dbmodel.UploadFailed, map[string]interface{}{"error": msg})
 }
 
 // cleanupExpired aborts + removes a few overdue sessions (opportunistic janitor).
@@ -314,13 +341,21 @@ func checkModalityMIME(modality, mime string) error {
 	if i := strings.IndexByte(kind, '/'); i > 0 {
 		kind = kind[:i]
 	}
-	if kind != "image" && kind != "audio" && kind != "video" {
-		return nil // inconclusive — trust dataset modality
+	// #5 医学模态也纳入判定:application/x-nifti→volume、application/x-wsi→wsi。
+	switch mime {
+	case "application/x-nifti":
+		kind = "volume"
+	case "application/x-wsi":
+		kind = "wsi"
 	}
-	if kind != modality {
-		return fmt.Errorf("content kind %q does not match dataset modality %q", kind, modality)
+	switch kind {
+	case "image", "audio", "video", "volume", "wsi":
+		if kind != modality {
+			return fmt.Errorf("content kind %q does not match dataset modality %q（PNG 传进 video 集这类路由错误）", kind, modality)
+		}
+		return nil
 	}
-	return nil
+	return nil // inconclusive — trust dataset modality
 }
 
 // randHex returns n random bytes hex-encoded.

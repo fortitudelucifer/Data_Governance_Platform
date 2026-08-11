@@ -136,6 +136,20 @@ func (r *DB) DeleteAnnotationTasksByAsset(ctx context.Context, assetID uint) err
 	return r.DB.WithContext(ctx).Where("asset_id = ?", assetID).Delete(&dbmodel.AnnotationTask{}).Error
 }
 
+// MarkTasksQCFailedByAsset moves an asset's **live** annotation tasks to QC_FAILED
+// (terminal, not claimable) — used when preprocessing terminally fails (#10). A
+// task created off an asset whose derive later dies (unsupported codec, corrupt
+// bytes) would otherwise stay claimable, and an annotator picks up a task that
+// can never be annotated (no derivatives). Already-terminal tasks are untouched
+// (kept for audit, not deleted).
+func (r *DB) MarkTasksQCFailedByAsset(ctx context.Context, assetID uint, reason string) error {
+	_ = reason // 具体原因记在资产的 preprocess_error 上;任务这里只翻状态,不动 jsonb error 列
+	return r.DB.WithContext(ctx).Model(&dbmodel.AnnotationTask{}).
+		Where("asset_id = ? AND state NOT IN ?", assetID,
+			[]string{dbmodel.TaskStateFinalized, dbmodel.TaskStateExported, dbmodel.TaskStateQCFailed}).
+		Update("state", dbmodel.TaskStateQCFailed).Error
+}
+
 // DeleteDerivativesByAsset hard-deletes all derivative rows of an asset.
 func (r *DB) DeleteDerivativesByAsset(ctx context.Context, assetID uint) error {
 	return r.DB.WithContext(ctx).Where("asset_id = ?", assetID).Delete(&dbmodel.AssetDerivative{}).Error
@@ -151,6 +165,23 @@ func (r *DB) CountAssetsBySHA256Except(ctx context.Context, sha string, excludeI
 	var n int64
 	err := r.DB.WithContext(ctx).Model(&dbmodel.Asset{}).
 		Where("sha256 = ? AND id <> ?", sha, excludeID).Count(&n).Error
+	return n, err
+}
+
+// CountAssetsByStorageURIExcept counts other assets referencing the **exact**
+// source object URI (#16). Deletion must refcount by the real object identity,
+// not the global SHA: source keys are dataset-scoped (KeyForContent embeds the
+// dataset id), so two datasets with identical bytes have *different* source URIs.
+// A global-SHA guard would (a) refuse to delete dataset A's own blob just because
+// dataset B has the same SHA at a different URI (leak), and (b) let a QC_FAILED
+// row with an empty URI block a real blob's deletion. Empty URIs never match.
+func (r *DB) CountAssetsByStorageURIExcept(ctx context.Context, storageURI string, excludeID uint) (int64, error) {
+	if storageURI == "" {
+		return 0, nil
+	}
+	var n int64
+	err := r.DB.WithContext(ctx).Model(&dbmodel.Asset{}).
+		Where("storage_uri = ? AND id <> ?", storageURI, excludeID).Count(&n).Error
 	return n, err
 }
 

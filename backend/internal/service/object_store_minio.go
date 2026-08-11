@@ -204,6 +204,23 @@ func (s *MinIOObjectStore) Delete(ctx context.Context, storageURI string) error 
 	return s.client.RemoveObject(ctx, s.bucket, objectKey, minio.RemoveObjectOptions{})
 }
 
+// DeletePrefix implements ObjectStore (#18): list + remove every object under the
+// prefix. MinIO's RemoveObject on a prefix key affects **no** sub-objects, so a
+// volume_slices/ directory of PNGs would leak entirely.
+func (s *MinIOObjectStore) DeletePrefix(ctx context.Context, prefixURI string) error {
+	prefix, err := s.uriToKey(prefixURI)
+	if err != nil {
+		return err
+	}
+	objCh := s.client.ListObjects(ctx, s.bucket, minio.ListObjectsOptions{Prefix: prefix, Recursive: true})
+	for e := range s.client.RemoveObjects(ctx, s.bucket, objCh, minio.RemoveObjectsOptions{}) {
+		if e.Err != nil {
+			return fmt.Errorf("delete prefix %q: %w", prefix, e.Err)
+		}
+	}
+	return nil
+}
+
 // Exists implements ObjectStore.
 func (s *MinIOObjectStore) Exists(ctx context.Context, storageURI string) (bool, error) {
 	objectKey, err := s.uriToKey(storageURI)

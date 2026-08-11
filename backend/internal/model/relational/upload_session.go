@@ -4,11 +4,12 @@ import "time"
 
 // Upload session status enum (plan_v2 T0.2).
 const (
-	UploadPending   = "pending"
-	UploadCompleted = "completed"
-	UploadAborted   = "aborted"
-	UploadExpired   = "expired"
-	UploadFailed    = "failed"
+	UploadPending    = "pending"
+	UploadCompleting = "completing" // #3 CAS pending→completing→completed 的中间态,串行化并发 Complete
+	UploadCompleted  = "completed"
+	UploadAborted    = "aborted"
+	UploadExpired    = "expired"
+	UploadFailed     = "failed"
 )
 
 // UploadSession tracks one resumable multipart upload. The bytes go straight

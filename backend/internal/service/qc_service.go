@@ -31,8 +31,11 @@ func DefaultQCConfig() QCConfig {
 		MaxPixelCount:    50_000_000, // 50M pixels (~7000x7000)，仅图片校验
 		LongImageRatio:   8.0,        // > 8:1 considered long image
 		AcceptedMIME: []string{
-			// 图片
-			"image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp",
+			// 图片。⚠️ #7 不含 webp/bmp:仓库没有注册它们的 decoder,image.DecodeConfig
+			// 对二者恒报 unknown → 完整 QC 必失败。既然解不了就别放进白名单假装支持
+			// (原来放了 → magic 嗅探接受、随后 decode 失败;>16MiB 走 multipart 还会被
+			// 标 passed,不一致)。要支持得先引入并注册 x/image 的 webp/bmp decoder + 同步 UI。
+			"image/jpeg", "image/png", "image/gif",
 			// 音频
 			"audio/mpeg", "audio/wav", "audio/x-wav", "audio/ogg", "audio/flac", "audio/mp4",
 			// 视频
@@ -176,15 +179,29 @@ func (q *QCService) Inspect(body io.Reader, declaredMIME string) (*QCReport, []b
 		report.IsLongImage = long
 	}
 
+	// #6 DecodeConfig 只读文件头(PNG 的 IHDR / JPEG 的 SOF),**证明不了图片完整可解码**:
+	// 合法头 + 缺 IDAT/IEND 的 PNG、只有 SOF 的截断 JPEG 都能读出宽高、标 passed,但浏览器
+	// 和 AI 都解不开——一张"通过 QC 却打不开"的图,是最典型的静默错。像素数上面已卡过上限
+	// (= 限住了这次完整解码的资源),这里做一次**完整解码**验证结构,解不出即 fail-closed。
+	if report.Status == qcPassed {
+		if _, _, derr := image.Decode(bytes.NewReader(raw)); derr != nil {
+			report.Status = qcFailed
+			report.Reasons = append(report.Reasons, fmt.Sprintf("image full decode failed (截断/损坏,仅有文件头): %v", derr))
+		}
+	}
+
 	clean := raw
 	if mime == "image/jpeg" {
 		stripped, err := stripJPEGExif(raw)
-		if err == nil {
+		if err != nil {
+			// #8 strip 失败 **fail-closed**。旧代码"记一笔、继续用原图"——含 EXIF/GPS/XMP/
+			// IPTC 的 PHI 就随原图 passed 出去了,"净化失败却仍通过"正是最危险的静默错。
+			// 宁可拒绝让上传方知道,也不放行一张没洗干净的图。
+			report.Status = qcFailed
+			report.Reasons = append(report.Reasons, fmt.Sprintf("JPEG 元数据净化失败(拒绝而非放行含 EXIF/XMP/IPTC 的原图): %v", err))
+		} else {
 			clean = stripped
 			report.SizeBytes = int64(len(clean))
-		} else {
-			// Strip failure is not fatal; record and continue with original.
-			report.Reasons = append(report.Reasons, fmt.Sprintf("exif strip skipped: %v", err))
 		}
 	}
 
@@ -236,11 +253,9 @@ func sniffImage(raw []byte) (string, string, bool) {
 		return "image/png", "png", true
 	case len(raw) >= 6 && (bytes.Equal(raw[:6], []byte("GIF87a")) || bytes.Equal(raw[:6], []byte("GIF89a"))):
 		return "image/gif", "gif", true
-	case len(raw) >= 12 && bytes.Equal(raw[:4], []byte("RIFF")) && bytes.Equal(raw[8:12], []byte("WEBP")):
-		return "image/webp", "webp", true
-	case len(raw) >= 2 && raw[0] == 'B' && raw[1] == 'M':
-		return "image/bmp", "bmp", true
 	}
+	// #7 webp/bmp 有意不识别:没有 decoder,识别了也只会在完整 QC 时 decode 失败。
+	// 不识别 → sniffMedia 走 declaredMIME,而白名单已移除二者 → 干净地拒("不支持的类型")。
 	return "", "", false
 }
 
@@ -248,12 +263,16 @@ func sniffImage(raw []byte) (string, string, bool) {
 // NIfTI 的魔数("n+1\0" / "ni1\0")在**偏移 344**,不在文件头——这是它和其它格式
 // 最不一样的地方,也是"按文件头嗅探"会漏掉它的原因。
 // .nii.gz 需要先解开头部若干字节才能看到 344 处;只解一小段,不整包解压。
+// niftiMagicAt344 只认 **"n+1"(单文件 .nii/.nii.gz)**,**不认 "ni1"**(#9)。
+// ni1 是 ANALYZE 衍生的**双文件**格式:头在 .hdr、体素在独立的 .img。单对象上传只能
+// 拿到其中一个文件,而 worker 又要求 vox_offset>=352(同文件内有体素)→ ni1 必然 terminal
+// reject。与其让它在 QC 蒙混过关、到 worker 才死,不如在准入处就当"不识别"拒掉(fail-closed)。
+// 要支持双文件 ni1 需上传 canonical manifest,按各文件 path/size/SHA 算资产 SHA(欠账)。
 func niftiMagicAt344(head []byte) bool {
 	if len(head) < 348 {
 		return false
 	}
-	m := string(head[344:347])
-	return m == "n+1" || m == "ni1"
+	return string(head[344:347]) == "n+1"
 }
 
 func sniffNIfTI(raw []byte) (string, bool) {
@@ -373,13 +392,20 @@ func stripJPEGExif(raw []byte) ([]byte, error) {
 		segStart := i
 		segEnd := i + segLen
 
-		// Drop EXIF (APP1 with "Exif\0\0") and APP2 ICC/EXIF makernote.
+		// #8 丢弃所有可能藏 PHI 的元数据段,不只 EXIF。旧代码只认 APP1/Exif,XMP、IPTC、
+		// COM 原样留下 —— 它们照样能带姓名/GPS/病历号。逐类清:
 		drop := false
-		if marker == 0xE1 {
+		switch marker {
+		case 0xE1: // APP1:EXIF(含 GPS/MakerNote)或 XMP
 			payload := raw[segStart+2 : segEnd]
-			if len(payload) >= 6 && bytes.HasPrefix(payload, []byte("Exif\x00\x00")) {
+			if bytes.HasPrefix(payload, []byte("Exif\x00\x00")) ||
+				bytes.HasPrefix(payload, []byte("http://ns.adobe.com/xap/")) {
 				drop = true
 			}
+		case 0xED: // APP13:IPTC / Photoshop 资源(常含版权/作者/说明)
+			drop = true
+		case 0xFE: // COM:注释段
+			drop = true
 		}
 		if !drop {
 			out = append(out, 0xFF, marker)

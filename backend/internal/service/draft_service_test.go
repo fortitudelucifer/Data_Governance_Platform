@@ -226,6 +226,18 @@ func (s *memStore) Delete(ctx context.Context, uri string) error {
 	delete(s.m, strings.TrimPrefix(uri, "mem://"))
 	return nil
 }
+func (s *memStore) DeletePrefix(ctx context.Context, prefixURI string) error {
+	if !strings.HasPrefix(prefixURI, "mem://") {
+		return errBareKey
+	}
+	p := strings.TrimPrefix(prefixURI, "mem://")
+	for k := range s.m {
+		if strings.HasPrefix(k, p) {
+			delete(s.m, k)
+		}
+	}
+	return nil
+}
 func (s *memStore) Exists(ctx context.Context, uri string) (bool, error) {
 	_, ok := s.m[strings.TrimPrefix(uri, "mem://")]
 	return ok, nil
