@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/png"
@@ -42,6 +43,30 @@ type exportBundle struct {
 
 const unlabeledCategory = "unlabeled"
 
+// ErrSelectedTasksMissing:显式 ?task_ids= 里有任务没有 FINALIZED 快照(仍在 QA /
+// 从未定稿 / 属于别的数据集)。导出必须 **fail-closed**(handler 映射 409 并列出缺失),
+// 绝不能返回一个"少了几个任务却仍是 200、文件名照写 selected2"的文件 —— 请求方会以为
+// 导全了(#3)。
+var ErrSelectedTasksMissing = errors.New("selected tasks have no finalized annotation")
+
+// requireAllTasks fails closed when an explicit selection asked for tasks that
+// produced no finalized data (#3). requested==nil (no filter) always passes.
+func requireAllTasks(requested []uint, found map[uint]bool) error {
+	if len(requested) == 0 {
+		return nil
+	}
+	var missing []uint
+	for _, id := range requested {
+		if !found[id] {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%w：任务 %v（无 FINALIZED 快照 / 仍在 QA / 不属于本数据集）", ErrSelectedTasksMissing, missing)
+	}
+	return nil
+}
+
 // gather loads finals (optionally since / taskIDs), their assets, and a
 // deterministic category index built from shape labels.
 func (s *ImageExportService) gather(ctx context.Context, datasetID uint, since *time.Time, taskIDs []uint) (*exportBundle, error) {
@@ -50,12 +75,25 @@ func (s *ImageExportService) gather(ctx context.Context, datasetID uint, since *
 		catIndex: map[string]int{},
 	}
 	labelSet := map[string]struct{}{}
+	foundTasks := map[uint]bool{}
 	_, err := s.payload.StreamFinalAnnotationsByDataset(ctx, datasetID, since, taskIDs, func(fa *paymodel.FinalAnnotation) error {
+		foundTasks[fa.TaskID] = true
 		b.finals = append(b.finals, *fa)
 		if _, ok := b.assets[fa.AssetID]; !ok {
-			if a, err := s.db.FindAssetByID(ctx, fa.AssetID); err == nil {
-				b.assets[fa.AssetID] = a
+			// #5 资产查询错误 / 尺寸非法 **fail-closed**,绝不吞掉。旧代码 `if err == nil`
+			// 直接吞——资产查不到就从 map 里缺席,下游 dims() 返回 0×0:COCO 写 width:0
+			// height:0、YOLO 静默跳过整张标签,导出仍是 200。几何一律存"旋转已应用的显示
+			// 像素空间"(坐标系纪律),尺寸未回填就无法归一化 → 宁可中止并指名资产,也不
+			// 产出坐标全错却"看着正常"的文件。
+			a, aerr := s.db.FindAssetByID(ctx, fa.AssetID)
+			if aerr != nil {
+				return fmt.Errorf("导出中止:资产 %d 查询失败(拒绝产出 0×0 几何/跳标的静默错误): %w", fa.AssetID, aerr)
 			}
+			if a.Width <= 0 || a.Height <= 0 {
+				return fmt.Errorf("导出中止:资产 %d 显示尺寸非法(%d×%d)——旋转后 width/height 未回填?"+
+					"几何无法归一化;请修好资产尺寸再导出(而不是导出坐标全错的文件)", fa.AssetID, a.Width, a.Height)
+			}
+			b.assets[fa.AssetID] = a
 		}
 		for _, sh := range fa.Shapes {
 			labelSet[labelOf(sh)] = struct{}{}
@@ -64,6 +102,12 @@ func (s *ImageExportService) gather(ctx context.Context, datasetID uint, since *
 	})
 	if err != nil {
 		return nil, err
+	}
+	// #3 显式选择的任务必须都有终稿;since 增量导出会合法地排除一些,故只在非增量时校验。
+	if since == nil {
+		if merr := requireAllTasks(taskIDs, foundTasks); merr != nil {
+			return nil, merr
+		}
 	}
 	cats := make([]string, 0, len(labelSet))
 	for l := range labelSet {
@@ -198,11 +242,18 @@ func maskToCocoRLE(pngB64 string, imgW, imgH int) (map[string]interface{}, error
 		return nil, fmt.Errorf("png decode mask: %w", err)
 	}
 	bounds := img.Bounds()
+	pw, ph := bounds.Dx(), bounds.Dy()
 	if imgW <= 0 {
-		imgW = bounds.Max.X - bounds.Min.X
+		imgW = pw
 	}
 	if imgH <= 0 {
-		imgH = bounds.Max.Y - bounds.Min.Y
+		imgH = ph
+	}
+	// #10 掩膜 PNG 尺寸必须与资产显示尺寸一致,不一致 **fail-closed**。旧代码直接按
+	// imgW×imgH 遍历,img.At 越界读到透明:较小的 PNG 被"透明补齐"、较大的被裁剪 —— 掩膜
+	// 悄悄平移/缺角却仍产出(旋转后资产尺寸没对上就是这个症状)。宁可报错也不产出错位掩膜。
+	if pw != imgW || ph != imgH {
+		return nil, fmt.Errorf("掩膜 PNG 尺寸 %d×%d 与资产显示尺寸 %d×%d 不符(错位的根源，拒绝导出)", pw, ph, imgW, imgH)
 	}
 
 	counts := make([]int, 0, 64)
@@ -210,7 +261,7 @@ func maskToCocoRLE(pngB64 string, imgW, imgH int) (map[string]interface{}, error
 	count := 0
 	for x := 0; x < imgW; x++ {
 		for y := 0; y < imgH; y++ {
-			r32, _, _, a32 := img.At(x, y).RGBA()
+			r32, _, _, a32 := img.At(bounds.Min.X+x, bounds.Min.Y+y).RGBA()
 			label := 0
 			if a32 > 0 && r32 > 0 {
 				label = 1
@@ -284,6 +335,21 @@ func maskToPolygonFlat(pngB64 string, imgW, imgH int) []float64 {
 	return flat
 }
 
+// rleForegroundArea counts foreground pixels in a COCO uncompressed RLE dict
+// (#12). maskToCocoRLE starts counting zeros, so counts alternate bg,fg,bg,fg…
+// — foreground is the sum of the odd-indexed runs.
+func rleForegroundArea(rle map[string]interface{}) float64 {
+	counts, ok := rle["counts"].([]int)
+	if !ok {
+		return 0
+	}
+	fg := 0
+	for i := 1; i < len(counts); i += 2 {
+		fg += counts[i]
+	}
+	return float64(fg)
+}
+
 func (b *exportBundle) fileName(assetID uint) string {
 	if a, ok := b.assets[assetID]; ok && a.OriginalName != "" {
 		return a.OriginalName
@@ -326,24 +392,36 @@ func (s *ImageExportService) BuildCOCO(ctx context.Context, datasetID uint, sinc
 			bx, by, bw, bh := shapeBBox(sh)
 
 			var segmentation interface{}
+			area := bw * bh // bbox 兜底面积
+			// #12 iscrowd 是显式业务语义(crowd 区域),不是"用了 RLE"。恒 0 —— 设成 1 会
+			// 改变 COCO 评估口径(iscrowd=1 走宽松匹配、且被 area 分桶排除),污染 mAP。
 			iscrowd := 0
 			if sh.Kind == "mask" {
 				if pngB64 := maskPngB64FromAttrs(sh.Attrs); pngB64 != "" {
-					if rle, err := maskToCocoRLE(pngB64, w, h); err == nil {
-						segmentation = rle
-						iscrowd = 1
+					// #10 掩膜声明了 PNG 就必须解得出:解不出(base64 坏 / 尺寸不符)一律
+					// **fail-closed**,绝不退化成 bbox 矩形——"声明是掩膜、导出却是方框"正是
+					// 那类"看着正常、内容错"的静默降级。
+					rle, rerr := maskToCocoRLE(pngB64, w, h)
+					if rerr != nil {
+						return nil, fmt.Errorf("导出中止:资产 %d 的掩膜无法编码为 RLE: %w", fa.AssetID, rerr)
 					}
+					segmentation = rle
+					area = rleForegroundArea(rle) // #12 掩膜面积 = 前景像素数,不是 bbox 面积
 				}
 			}
 			if segmentation == nil {
-				segmentation = [][]float64{shapePolygonFlat(sh)}
+				poly := shapePolygonFlat(sh)
+				segmentation = [][]float64{poly}
+				if sh.Kind == "polygon" && len(poly) >= 6 {
+					area = polygonArea(poly) // #12 多边形面积用鞋带公式,不是 bbox 面积
+				}
 			}
 
 			annotations = append(annotations, map[string]interface{}{
 				"id": annID, "image_id": imgID,
 				"category_id":  b.catIndex[labelOf(sh)] + 1,
 				"bbox":         []float64{bx, by, bw, bh},
-				"area":         bw * bh,
+				"area":         area,
 				"segmentation": segmentation,
 				"iscrowd":      iscrowd,
 			})
@@ -383,7 +461,7 @@ func (s *ImageExportService) BuildYOLOSeg(ctx context.Context, datasetID uint, s
 		if w <= 0 || h <= 0 {
 			continue // cannot normalize without dimensions
 		}
-		stem := stripExt(b.fileName(fa.AssetID))
+		stem := safeStem(stripExt(b.fileName(fa.AssetID))) // #14 zip-slip:OriginalName 不可信
 		var lines string
 		for _, sh := range fa.Shapes {
 			var flat []float64

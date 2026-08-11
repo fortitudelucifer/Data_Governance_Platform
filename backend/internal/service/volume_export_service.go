@@ -239,6 +239,18 @@ func BuildOverlapNote(pairs []OverlapPair) string {
 
 // WriteVolumeExportZip packs per-segment binary NIfTIs plus labels.json.
 func WriteVolumeExportZip(segs []VolumeSegment, man VolumeExportManifest, dims [3]int, affine [3][4]float64, orient *NIfTIOrientation) ([]byte, error) {
+	// #22 split 路径的内存预算漏算:BuildVolumeSegments 只按整卷 dense masks(len×n)算过,
+	// 但逐段导出还会把每段的压缩 NIfTI **累积进内存里的 zip**(handler 再整个持有),这块
+	// 最坏(不可压)≈ 段数×n,没被计。这里补一道更紧的预算:masks + 最坏累积 zip + 每段
+	// 瞬时(uint16+raw)一起过——超限 fail-closed。512³×多段的合法请求本可 OOM 进程,现被挡。
+	// 真正的"逐段流式写进 gzip/zip + 流式响应"是里程碑欠账(见 STATUS)。
+	if len(segs) > 0 {
+		n := int64(dims[0]) * int64(dims[1]) * int64(dims[2])
+		if est := n * int64(2*len(segs)+2); est > maxVolumeExportBytes {
+			return nil, fmt.Errorf("逐段 zip 导出预计占用 %.1f GB（%d 段:整卷掩膜 + 累积压缩包），超过上限 %d GB:请减少段数或分批导出",
+				float64(est)/(1<<30), len(segs), maxVolumeExportBytes>>30)
+		}
+	}
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
 

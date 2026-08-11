@@ -37,14 +37,26 @@ var envelopeCSVColumns = []string{
 // legacy documents fall back to doc_key, version, data, created_by.
 func (p *CSVExportPlugin) Serialize(docs []paymodel.ExportDocument, writer io.Writer) error {
 	w := csv.NewWriter(writer)
-	defer w.Flush()
 
 	useEnvelope := len(docs) > 0 && docs[0].Envelope != nil
+	var err error
 	if useEnvelope {
-		return p.serializeEnvelope(w, docs)
+		err = p.serializeEnvelope(w, docs)
+	} else {
+		err = p.serializeLegacy(w, docs)
 	}
+	if err != nil {
+		return err
+	}
+	// #21 **必须显式检查 Flush 错误**。csv.Writer 带缓冲——前面每个 w.Write 都可能
+	// "成功",真正的落盘错误(磁盘满 / 连接断 / 写到一半)只在 Flush 时才暴露。旧代码
+	// `defer w.Flush()` 把这个错误直接吞了,于是下游拿到一个**截断的 CSV 却是 200**。
+	w.Flush()
+	return w.Error()
+}
 
-	// Legacy: header doc_key, version, data, created_by.
+// serializeLegacy writes the pre-envelope CSV shape: doc_key, version, data, created_by.
+func (p *CSVExportPlugin) serializeLegacy(w *csv.Writer, docs []paymodel.ExportDocument) error {
 	if err := w.Write([]string{"doc_key", "version", "data", "created_by"}); err != nil {
 		return fmt.Errorf("failed to write CSV header: %w", err)
 	}

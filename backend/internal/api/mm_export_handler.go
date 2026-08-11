@@ -3,6 +3,7 @@ package api
 import (
 	"archive/zip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -15,6 +16,16 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+// exportError maps export-service errors to HTTP status (#3): a selection that
+// named tasks with no finalized snapshot is a client error (409), not a 500.
+func exportError(c *gin.Context, err error) {
+	if errors.Is(err, service.ErrSelectedTasksMissing) {
+		Error(c, http.StatusConflict, err.Error())
+		return
+	}
+	Error(c, http.StatusInternalServerError, err.Error())
+}
 
 // ImageExportHandler bundles multi-modal dataset export endpoints:
 // streaming final annotations as JSONL, COCO JSON, COCO JSON-LD, and YOLO-seg ZIP.
@@ -49,7 +60,11 @@ func (h *ImageExportHandler) ExportDatasetFinalAnnotations(c *gin.Context) {
 		}
 		since = &t
 	}
-	taskIDs := parseTaskIDs(c)
+	taskIDs, err := parseTaskIDs(c)
+	if err != nil {
+		Error(c, http.StatusBadRequest, err.Error())
+		return
+	}
 	fname := exportFilename(id, "final.jsonl", taskIDs)
 	c.Header("Content-Type", "application/x-ndjson; charset=utf-8")
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, fname))
@@ -75,10 +90,14 @@ func (h *ImageExportHandler) ExportCOCO(c *gin.Context) {
 		Error(c, http.StatusBadRequest, "since must be RFC3339")
 		return
 	}
-	taskIDs := parseTaskIDs(c)
+	taskIDs, err := parseTaskIDs(c)
+	if err != nil {
+		Error(c, http.StatusBadRequest, err.Error())
+		return
+	}
 	doc, err := h.imgExport.BuildCOCO(c.Request.Context(), uint(id), since, taskIDs)
 	if err != nil {
-		Error(c, http.StatusInternalServerError, err.Error())
+		exportError(c, err)
 		return
 	}
 	fname := exportFilename(id, "coco.json", taskIDs)
@@ -98,10 +117,14 @@ func (h *ImageExportHandler) ExportJSONLD(c *gin.Context) {
 		Error(c, http.StatusBadRequest, "since must be RFC3339")
 		return
 	}
-	taskIDs := parseTaskIDs(c)
+	taskIDs, err := parseTaskIDs(c)
+	if err != nil {
+		Error(c, http.StatusBadRequest, err.Error())
+		return
+	}
 	doc, err := h.imgExport.BuildJSONLD(c.Request.Context(), uint(id), since, taskIDs)
 	if err != nil {
-		Error(c, http.StatusInternalServerError, err.Error())
+		exportError(c, err)
 		return
 	}
 	fname := exportFilename(id, "annotations.jsonld", taskIDs)
@@ -123,10 +146,14 @@ func (h *ImageExportHandler) ExportYOLOSeg(c *gin.Context) {
 		Error(c, http.StatusBadRequest, "since must be RFC3339")
 		return
 	}
-	taskIDs := parseTaskIDs(c)
+	taskIDs, err := parseTaskIDs(c)
+	if err != nil {
+		Error(c, http.StatusBadRequest, err.Error())
+		return
+	}
 	exp, err := h.imgExport.BuildYOLOSeg(c.Request.Context(), uint(id), since, taskIDs)
 	if err != nil {
-		Error(c, http.StatusInternalServerError, err.Error())
+		exportError(c, err)
 		return
 	}
 	fname := exportFilename(id, "yolo-seg.zip", taskIDs)
@@ -164,18 +191,30 @@ func parseSince(c *gin.Context) (*time.Time, bool) {
 }
 
 // parseTaskIDs reads the optional ?task_ids=1,2,3 query param.
-func parseTaskIDs(c *gin.Context) []uint {
+//
+// #2 fail-**closed**:参数**出现**但含空项 / 非法值 / 溢出 → 返回 error(上层 400)。
+// 绝不把"给了个坏参数"静默降级成 nil —— 因为 nil 在下游=「无筛选=导出整集」,这是
+// 最阴的 fail-open:请求方以为在导一个子集,实际拿到了全量(task_ids=abc → 空 → 全导;
+// task_ids=101,abc → 悄悄只剩 101)。只有参数**根本没出现**才返回 (nil, nil)=真·无筛选。
+func parseTaskIDs(c *gin.Context) ([]uint, error) {
 	raw := c.Query("task_ids")
 	if raw == "" {
-		return nil
+		return nil, nil // 未提供该参数 = 无筛选(合法)
 	}
-	var ids []uint
-	for _, part := range strings.Split(raw, ",") {
-		if id, err := strconv.ParseUint(strings.TrimSpace(part), 10, 64); err == nil {
-			ids = append(ids, uint(id))
+	parts := strings.Split(raw, ",")
+	ids := make([]uint, 0, len(parts))
+	for _, part := range parts {
+		p := strings.TrimSpace(part)
+		if p == "" {
+			return nil, fmt.Errorf("task_ids 含空项(如尾随逗号)：%q", raw)
 		}
+		id, err := strconv.ParseUint(p, 10, 64)
+		if err != nil || id == 0 {
+			return nil, fmt.Errorf("task_ids 含非法/越界任务号：%q", part)
+		}
+		ids = append(ids, uint(id))
 	}
-	return ids
+	return ids, nil
 }
 
 // exportFilename builds a Content-Disposition filename that embeds the

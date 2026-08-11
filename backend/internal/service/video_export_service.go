@@ -40,7 +40,16 @@ type vidDoc struct {
 	Name    string
 	Fps     float64
 	W, H    int
-	Tracks  []vidTrack
+	// TotalFrames 是**媒体总帧数**(时长×fps),给 CVAT <size> 用(#9);0=未知,回退到
+	// 标注跨度。绝不能拿"最后标注帧"当媒体长度——1000 帧视频只在 0–9 帧标注会让 CVAT
+	// size=10,下游把整段视频截短成 10 帧。
+	TotalFrames int
+	// Stem 是本次导出内**唯一**的文件名干(#13)。两个资产同名 image.mp4 时,若各处
+	// 直接用 stemOf(Name),YOLO 的 labels/<stem>/ 会互相覆盖、COCO/Datumaro 的 item id
+	// 会撞成同一条 —— 一个视频的标注悄悄盖掉另一个。collect 里按 asset 顺序去重一次,
+	// 所有逐帧格式共用它,身份唯一是结构保证而非各自为政。
+	Stem   string
+	Tracks []vidTrack
 }
 
 // collect groups the latest FINALIZED track snapshots by asset (video). When a
@@ -51,6 +60,7 @@ func (s *VideoExportService) collect(ctx context.Context, datasetID uint, taskID
 	}
 	latest := map[key]*paymodel.TrackSnapshot{}
 	assetOfTask := map[int]uint{}
+	foundTasks := map[uint]bool{}
 	_, err := s.payload.StreamTrackSnapshotsByDataset(ctx, datasetID, taskIDs, func(snap *paymodel.TrackSnapshot) error {
 		k := key{int(snap.TaskID), snap.TrackID}
 		if cur, ok := latest[k]; !ok || snap.FinalizedAt.After(cur.FinalizedAt) {
@@ -58,38 +68,59 @@ func (s *VideoExportService) collect(ctx context.Context, datasetID uint, taskID
 			latest[k] = &cp
 		}
 		assetOfTask[int(snap.TaskID)] = snap.AssetID
+		foundTasks[snap.TaskID] = true
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+	// #3 显式选择的任务必须都有 FINALIZED 快照,缺则 409(不返回"少了几个却仍 200"的 zip)。
+	if merr := requireAllTasks(taskIDs, foundTasks); merr != nil {
+		return nil, merr
+	}
 
 	byAsset := map[uint]*vidDoc{}
 	var order []uint
 	names := map[uint]struct {
-		name   string
-		fps    float64
-		w, h   int
+		name        string
+		fps         float64
+		w, h        int
+		totalFrames int
 	}{}
 	for _, snap := range latest {
+		// #6 cells(检测/实例分割)不能进逐帧视频格式:它的几何全在嵌套 instances 里,
+		// kfToInterp 不搬、每种视频格式都静默丢掉整条轨迹。宁可 fail-closed 指路 detection 导出。
+		if snap.Kind == paymodel.TrackKindCells {
+			return nil, fmt.Errorf("导出中止:视频导出不支持 cells 轨迹(task %d track %d)——"+
+				"cells 是检测/实例分割,请走 detection 导出而不是逐帧视频格式", snap.TaskID, snap.TrackID)
+		}
 		info, ok := names[snap.AssetID]
 		if !ok {
+			// #5 资产查询失败 **fail-closed**,不再吞错。旧代码 `if e == nil` 吞掉查询错误、
+			// 还退回虚构的 30fps —— 假 fps 会给 CFR 帧号算出假时间戳,假尺寸让归一化全错。
+			a, e := s.db.FindAssetByID(ctx, snap.AssetID)
+			if e != nil {
+				return nil, fmt.Errorf("导出中止:视频资产 %d 查询失败(拒绝退回假 fps/假尺寸): %w", snap.AssetID, e)
+			}
 			info.name = fmt.Sprintf("asset-%d", snap.AssetID)
-			info.fps = 30
-			if a, e := s.db.FindAssetByID(ctx, snap.AssetID); e == nil && a != nil {
-				if a.OriginalName != "" {
-					info.name = a.OriginalName
-				}
-				if a.FPS != nil && *a.FPS > 0 {
-					info.fps = *a.FPS
-				}
-				info.w, info.h = a.Width, a.Height
+			if a.OriginalName != "" {
+				info.name = a.OriginalName
+			}
+			info.fps = 30 // CFR 兜底(keyframe 自带 ts,逐帧展开不依赖它;仅 JSONL 元信息用)
+			if a.FPS != nil && *a.FPS > 0 {
+				info.fps = *a.FPS
+			}
+			info.w, info.h = a.Width, a.Height
+			// #9 媒体总帧数 = 时长×fps(取整),给 CVAT <size> 用。缺时长/fps 则置 0,
+			// writeCVATXML 回退到标注跨度(与旧行为一致,但有真值时优先用真值)。
+			if a.DurationMs != nil && *a.DurationMs > 0 && info.fps > 0 {
+				info.totalFrames = int(math.Round(float64(*a.DurationMs) / 1000.0 * info.fps))
 			}
 			names[snap.AssetID] = info
 		}
 		doc, ok := byAsset[snap.AssetID]
 		if !ok {
-			doc = &vidDoc{AssetID: snap.AssetID, Name: info.name, Fps: info.fps, W: info.w, H: info.h}
+			doc = &vidDoc{AssetID: snap.AssetID, Name: info.name, Fps: info.fps, W: info.w, H: info.h, TotalFrames: info.totalFrames}
 			byAsset[snap.AssetID] = doc
 			order = append(order, snap.AssetID)
 		}
@@ -97,12 +128,31 @@ func (s *VideoExportService) collect(ctx context.Context, datasetID uint, taskID
 	}
 	sort.Slice(order, func(i, j int) bool { return order[i] < order[j] })
 	out := make([]vidDoc, 0, len(order))
+	takenStem := map[string]bool{} // #13 导出内唯一文件名干,一次去重供所有逐帧格式共用
 	for _, aid := range order {
 		d := byAsset[aid]
 		sort.Slice(d.Tracks, func(i, j int) bool { return d.Tracks[i].TrackID < d.Tracks[j].TrackID })
+		base := stemOf(d.Name)
+		stem := base
+		for n := 1; takenStem[stem]; n++ {
+			stem = fmt.Sprintf("%s-%d", base, n)
+		}
+		takenStem[stem] = true
+		d.Stem = stem
 		out = append(out, *d)
 	}
 	return out, nil
+}
+
+// stemFor returns a doc's export-unique filename stem (#13). collect assigns a
+// deduped Stem; when a vidDoc is built by another path (tests) that leaves it
+// empty, fall back to the (path-safe) stem derived from Name so we never emit an
+// empty `labels//…` entry.
+func stemFor(d vidDoc) string {
+	if d.Stem != "" {
+		return d.Stem
+	}
+	return stemOf(d.Name)
 }
 
 // IsPerFile reports whether a format exports one file per video (→ zip).
@@ -122,7 +172,7 @@ func (s *VideoExportService) BuildZip(ctx context.Context, datasetID uint, taskI
 	}
 	out := make(map[string]string, len(docs))
 	for _, d := range docs {
-		fname := zipEntryName(out, stemOf(d.Name), format)
+		fname := zipEntryName(out, stemFor(d), format)
 		if format == "cvat" {
 			out[fname] = buildCVATXML(d)
 		} else {
@@ -146,7 +196,7 @@ func (s *VideoExportService) StreamZip(ctx context.Context, datasetID uint, task
 	}
 	seen := map[string]string{} // name → "" (reuse zipEntryName's de-dupe)
 	for _, d := range docs {
-		fname := zipEntryName(seen, stemOf(d.Name), format)
+		fname := zipEntryName(seen, stemFor(d), format)
 		seen[fname] = ""
 		w, aerr := addFile(fname)
 		if aerr != nil {
@@ -252,8 +302,13 @@ func buildCVATXML(d vidDoc) string {
 
 func writeCVATXML(w io.Writer, d vidDoc) {
 	io.WriteString(w, `<?xml version="1.0" encoding="utf-8"?>`+"\n<annotations>\n  <version>1.1</version>\n")
+	// #9 <size> 用媒体总帧数;缺失(0)才回退到标注跨度。
+	size := d.TotalFrames
+	if size <= 0 {
+		size = frameSpan(d)
+	}
 	fmt.Fprintf(w, "  <meta><task><name>%s</name><size>%d</size><original_size><width>%d</width><height>%d</height></original_size></task></meta>\n",
-		xmlEsc(d.Name), frameSpan(d), d.W, d.H)
+		xmlEsc(d.Name), size, d.W, d.H)
 	for _, t := range d.Tracks {
 		fmt.Fprintf(w, `  <track id="%d" label="%s">`+"\n", t.TrackID, xmlEsc(t.Label))
 		kfs := sortedKfs(t.Keyframes)
@@ -315,6 +370,15 @@ func (ti trackInterp) geomAt(f int) (InterpolatedGeom, bool) {
 		return InterpolatedGeom{}, false
 	}
 	return InterpolateAt(ti.kfs, frameToTs(ti.kfs, f))
+}
+
+// occludedAt returns the track's occluded flag on frame f (#7). Datumaro claims
+// lossless round-trip, so it must carry the real per-frame occluded, not a
+// hardcoded false. Interpolated frames hold the governing keyframe's flag (same
+// hold semantics as geometry). ok=false → treated as not-occluded.
+func (ti trackInterp) occludedAt(f int) bool {
+	g, ok := ti.geomAt(f)
+	return ok && g.Occluded
 }
 
 // boxAt returns the track's box on frame f as [x,y,w,h].
@@ -424,21 +488,33 @@ func writeMOT(w io.Writer, d vidDoc) {
 // stable across every video in one export, so it is computed over all docs.
 func labelIndex(docs []vidDoc) ([]string, map[string]int) {
 	seen := map[string]bool{}
+	hasEmpty := false
 	for _, d := range docs {
 		for _, t := range d.Tracks {
-			if t.Label != "" {
+			if t.Label == "" {
+				hasEmpty = true
+			} else {
 				seen[t.Label] = true
 			}
 		}
 	}
-	names := make([]string, 0, len(seen))
+	names := make([]string, 0, len(seen)+1)
 	for n := range seen {
 		names = append(names, n)
 	}
 	sort.Strings(names)
-	idx := make(map[string]int, len(names))
+	// #8 空标签轨迹必须映到一个**显式** unlabeled 类别。旧代码把空标签排除在类别表外,
+	// 于是 idx[""] 取 Go map 零值 0 → 空标签被导成第一个类别(如 "car");若全为空还会
+	// 引用不存在的类别。给它一个真类别,类别收集与引用共用同一份 idx。
+	if hasEmpty {
+		names = append(names, unlabeledCategory)
+	}
+	idx := make(map[string]int, len(names)+1)
 	for i, n := range names {
 		idx[n] = i
+	}
+	if hasEmpty {
+		idx[""] = idx[unlabeledCategory] // 空标签显式指向 unlabeled,不落到 category 0
 	}
 	return names, idx
 }
@@ -466,7 +542,7 @@ func writeCOCO(w io.Writer, docs []vidDoc) {
 		if !ok {
 			continue
 		}
-		stem := stemOf(d.Name)
+		stem := stemFor(d)
 		for f := lo; f <= hi; f++ {
 			if !anyBoxAt(tis, f) {
 				continue
@@ -543,7 +619,7 @@ func writeDatumaro(w io.Writer, docs []vidDoc) {
 		if !ok {
 			continue
 		}
-		stem := stemOf(d.Name)
+		stem := stemFor(d)
 		for f := lo; f <= hi; f++ {
 			if !anyBoxAt(tis, f) {
 				continue
@@ -565,13 +641,14 @@ func writeDatumaro(w io.Writer, docs []vidDoc) {
 				firstAnn = false
 				// Datumaro is the lossless pivot: a mask track must round-trip as a
 				// polygon, not be flattened into its enclosing box.
+				occ := ti.occludedAt(f) // #7 如实输出遮挡,不写死 false
 				if pts, hasPoly := ti.polygonAt(f); hasPoly && isPolygonKind(ti.t.Kind) {
-					fmt.Fprintf(w, `{"id":%d,"type":"polygon","label_id":%d,"points":%s,"group":0,"z_order":0,"attributes":{"track_id":%d,"keyframe":%t,"occluded":false}}`,
-						ai, idx[ti.t.Label], ptsJSON(pts), ti.t.TrackID, isKeyframe(ti, f))
+					fmt.Fprintf(w, `{"id":%d,"type":"polygon","label_id":%d,"points":%s,"group":0,"z_order":0,"attributes":{"track_id":%d,"keyframe":%t,"occluded":%t}}`,
+						ai, idx[ti.t.Label], ptsJSON(pts), ti.t.TrackID, isKeyframe(ti, f), occ)
 					continue
 				}
-				fmt.Fprintf(w, `{"id":%d,"type":"bbox","label_id":%d,"bbox":[%.2f,%.2f,%.2f,%.2f],"group":0,"z_order":0,"attributes":{"track_id":%d,"keyframe":%t,"occluded":false}}`,
-					ai, idx[ti.t.Label], b[0], b[1], b[2], b[3], ti.t.TrackID, isKeyframe(ti, f))
+				fmt.Fprintf(w, `{"id":%d,"type":"bbox","label_id":%d,"bbox":[%.2f,%.2f,%.2f,%.2f],"group":0,"z_order":0,"attributes":{"track_id":%d,"keyframe":%t,"occluded":%t}}`,
+					ai, idx[ti.t.Label], b[0], b[1], b[2], b[3], ti.t.TrackID, isKeyframe(ti, f), occ)
 			}
 			fmt.Fprintf(w, `],"attr":{"frame":%d},"image":{"path":%q,"size":[%d,%d]}}`,
 				f, frameFileName(stem, f), d.H, d.W)
@@ -593,7 +670,6 @@ func writeYOLOZip(docs []vidDoc, addFile func(name string) (io.Writer, error)) e
 		fmt.Fprintln(cw, n)
 	}
 
-	taken := map[string]bool{}
 	for _, d := range docs {
 		if d.W <= 0 || d.H <= 0 {
 			continue // cannot normalise without frame dimensions
@@ -603,11 +679,7 @@ func writeYOLOZip(docs []vidDoc, addFile func(name string) (io.Writer, error)) e
 		if !ok {
 			continue
 		}
-		stem := stemOf(d.Name)
-		for n := 1; taken[stem]; n++ {
-			stem = fmt.Sprintf("%s-%d", stemOf(d.Name), n)
-		}
-		taken[stem] = true
+		stem := stemFor(d) // #13 collect 已保证导出内唯一,不再各自 dedup
 
 		imgW, imgH := float64(d.W), float64(d.H)
 		for f := lo; f <= hi; f++ {

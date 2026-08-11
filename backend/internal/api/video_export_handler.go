@@ -48,7 +48,11 @@ func (h *VideoExportHandler) ExportVideo(c *gin.Context) {
 		Error(c, http.StatusBadRequest, "format must be one of "+videoFormatList)
 		return
 	}
-	taskIDs := parseTaskIDs(c)
+	taskIDs, err := parseTaskIDs(c)
+	if err != nil {
+		Error(c, http.StatusBadRequest, err.Error())
+		return
+	}
 	ctx := c.Request.Context()
 
 	if h.videoExport.IsPerFile(format) {
@@ -79,7 +83,7 @@ func (h *VideoExportHandler) ExportVideo(c *gin.Context) {
 		return c.Writer, nil
 	}); serr != nil {
 		if !c.Writer.Written() {
-			Error(c, http.StatusInternalServerError, serr.Error())
+			exportError(c, serr)
 		}
 		return
 	}

@@ -37,22 +37,55 @@ type audioDoc struct {
 	Segs    []audioSeg
 }
 
+// audioAssetMeta caches per-asset name + duration so we validate intervals once
+// against the real audio length (#15) without re-querying per final.
+type audioAssetMeta struct {
+	name string
+	dur  int64 // ms; 0 = unknown
+}
+
 // collect gathers finalized audio docs for a dataset (optionally task-filtered).
 func (s *AudioExportService) collect(ctx context.Context, datasetID uint, taskIDs []uint) ([]audioDoc, error) {
-	names := map[uint]string{}
+	cache := map[uint]audioAssetMeta{}
+	foundTasks := map[uint]bool{}
 	var docs []audioDoc
 	_, err := s.payload.StreamFinalAnnotationsByDataset(ctx, datasetID, nil, taskIDs, func(fa *paymodel.FinalAnnotation) error {
+		foundTasks[fa.TaskID] = true
+		meta, ok := cache[fa.AssetID]
+		if !ok {
+			// #15 资产查询失败也 fail-closed——拿不到时长就无法校验区间,不能默默产出。
+			a, aerr := s.db.FindAssetByID(ctx, fa.AssetID)
+			if aerr != nil {
+				return fmt.Errorf("导出中止:音频资产 %d 查询失败(拒绝产出区间错乱的字幕/RTTM): %w", fa.AssetID, aerr)
+			}
+			meta = audioAssetMeta{name: fmt.Sprintf("asset-%d", fa.AssetID)}
+			if a.OriginalName != "" {
+				meta.name = a.OriginalName
+			}
+			if a.DurationMs != nil {
+				meta.dur = *a.DurationMs
+			}
+			cache[fa.AssetID] = meta
+		}
+
 		var segs []audioSeg
 		for _, sh := range fa.Shapes {
 			if sh.Kind != "audio_region" {
 				continue
 			}
-			var start, end int64
-			if sh.TimeStartMs != nil {
-				start = *sh.TimeStartMs
+			// #15 时间区间**统一在此校验**,fail-closed。旧代码让缺失端点默默变 0,再由各
+			// 格式各自"纠正":字幕层把负数钳到 0、RTTM 写负起点/负 duration、CSV/JSONL 原样
+			// —— 同一份坏数据导出三种文件三种样子,且都不报错。这里一次性挡住:端点缺失 /
+			// start<0 / end<=start / end>时长 都拒绝并指名资产。
+			if sh.TimeStartMs == nil || sh.TimeEndMs == nil {
+				return fmt.Errorf("导出中止:资产 %d 有音频区间缺时间端点(start/end 为空)", fa.AssetID)
 			}
-			if sh.TimeEndMs != nil {
-				end = *sh.TimeEndMs
+			start, end := *sh.TimeStartMs, *sh.TimeEndMs
+			if start < 0 || end <= start {
+				return fmt.Errorf("导出中止:资产 %d 音频区间非法 [%d,%d)ms(要求 0<=start<end)", fa.AssetID, start, end)
+			}
+			if meta.dur > 0 && end > meta.dur {
+				return fmt.Errorf("导出中止:资产 %d 音频区间 end=%dms 超出音频时长 %dms", fa.AssetID, end, meta.dur)
 			}
 			text, _ := sh.Attrs["text"].(string)
 			spk, _ := sh.Attrs["speaker"].(string)
@@ -63,19 +96,17 @@ func (s *AudioExportService) collect(ctx context.Context, datasetID uint, taskID
 			return nil
 		}
 		sort.Slice(segs, func(i, j int) bool { return segs[i].StartMs < segs[j].StartMs })
-		name, ok := names[fa.AssetID]
-		if !ok {
-			if a, e := s.db.FindAssetByID(ctx, fa.AssetID); e == nil && a != nil && a.OriginalName != "" {
-				name = a.OriginalName
-			} else {
-				name = fmt.Sprintf("asset-%d", fa.AssetID)
-			}
-			names[fa.AssetID] = name
-		}
-		docs = append(docs, audioDoc{AssetID: fa.AssetID, Name: name, Segs: segs})
+		docs = append(docs, audioDoc{AssetID: fa.AssetID, Name: meta.name, Segs: segs})
 		return nil
 	})
-	return docs, err
+	if err != nil {
+		return nil, err
+	}
+	// #3 显式选择的任务必须都有终稿,缺则 409。
+	if merr := requireAllTasks(taskIDs, foundTasks); merr != nil {
+		return nil, merr
+	}
+	return docs, nil
 }
 
 // IsPerFile reports whether a format exports one file per audio (→ zip) vs a
@@ -230,12 +261,42 @@ func hmsm(ms int64) (int64, int64, int64, int64) {
 	return ms / 3600000, (ms % 3600000) / 60000, (ms % 60000) / 1000, ms % 1000
 }
 
-// stemOf strips the extension from a filename for use as a subtitle/file id.
+// stemOf strips the extension from a filename for use as a subtitle/file id or a
+// zip entry stem. **The result is path-safe** (#14): stems come from the
+// untrusted upload OriginalName, and they land in zip entry names like
+// `labels/<stem>.txt` / `<stem>/000001.jpg` — an OriginalName of `../../outside`
+// would otherwise write a zip entry `labels/../../outside.txt`, and a fragile
+// extractor would drop the file outside the target dir (zip-slip).
 func stemOf(name string) string {
 	if i := strings.LastIndexByte(name, '.'); i > 0 {
-		return name[:i]
+		name = name[:i]
 	}
-	return name
+	return safeStem(name)
+}
+
+// safeStem turns an untrusted filename into a single **flat, path-safe** segment
+// for a zip entry (#14 zip-slip). Neutralizes everything that could escape the
+// entry's directory: path separators (/ \), drive colon, control chars, and
+// dot-only names (".", ".."). `../../etc/passwd` → a harmless flat token; a clean
+// name like `scan01` passes through unchanged (existing filenames don't move).
+func safeStem(name string) string {
+	name = strings.ReplaceAll(name, "\\", "/")
+	if i := strings.LastIndexByte(name, '/'); i >= 0 {
+		name = name[i+1:] // keep only the final component (defence in depth)
+	}
+	out := make([]rune, 0, len(name))
+	for _, r := range name {
+		if r == '/' || r == '\\' || r == ':' || r == 0 || r < 0x20 {
+			out = append(out, '_')
+			continue
+		}
+		out = append(out, r)
+	}
+	s := strings.TrimSpace(string(out))
+	if s == "" || strings.Trim(s, ".") == "" { // "", ".", "..", "..." → 无意义且危险
+		return "unnamed"
+	}
+	return s
 }
 
 // csvField quotes a CSV field when it contains a comma, quote, or newline.

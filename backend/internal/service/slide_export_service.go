@@ -3,6 +3,7 @@ package service
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -67,9 +68,12 @@ func BuildSlideGeoJSON(tracks []paymodel.Track) ([]byte, error) {
 		if len(t.Keyframes) == 0 {
 			continue
 		}
-		ring, ok := ringForTrack(t)
+		ring, ok, err := ringForTrack(t)
+		if err != nil {
+			return nil, err // #23 坐标损坏 fail-closed,不静默丢一维产出错区域
+		}
 		if !ok {
-			continue // 非 2D 区域(voxel_mask/关键点等),或几何不足
+			continue // 非 2D 区域(voxel_mask/关键点等)、outside、或几何不足
 		}
 		props := geoProperties{ObjectType: "annotation", Name: t.Label}
 		if t.Label != "" {
@@ -86,33 +90,55 @@ func BuildSlideGeoJSON(tracks []paymodel.Track) ([]byte, error) {
 
 // ringForTrack 取轨迹首关键帧的几何,返回**闭合**的外环([point][x,y])。
 // bbox → 四角矩形;polygon → 顶点序列。都在 level-0 像素空间。
-func ringForTrack(t paymodel.Track) ([][]float64, bool) {
+func ringForTrack(t paymodel.Track) ([][]float64, bool, error) {
 	kf := t.Keyframes[0]
+	// #23 outside 关键帧不产几何——它表示"该对象在这里不存在"。旧代码无视 outside、
+	// 照用残留的 points → 已删除的区域在导出里**复活**。跳过(不是错误,是正常缺席)。
+	if kf.Outside {
+		return nil, false, nil
+	}
 	switch t.Kind {
 	case paymodel.TrackKindBBox:
 		if len(kf.Bbox) != 4 {
-			return nil, false
+			return nil, false, nil
+		}
+		for _, v := range kf.Bbox {
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				return nil, false, fmt.Errorf("track %d 的 bbox 含非有限值: %v", t.TrackID, kf.Bbox)
+			}
 		}
 		x, y, w, h := kf.Bbox[0], kf.Bbox[1], kf.Bbox[2], kf.Bbox[3]
-		return [][]float64{{x, y}, {x + w, y}, {x + w, y + h}, {x, y + h}, {x, y}}, true
+		if w <= 0 || h <= 0 {
+			return nil, false, fmt.Errorf("track %d 的 bbox 退化(宽/高非正): %v", t.TrackID, kf.Bbox)
+		}
+		return [][]float64{{x, y}, {x + w, y}, {x + w, y + h}, {x, y + h}, {x, y}}, true, nil
 	case paymodel.TrackKindPolygon, paymodel.TrackKindMask:
-		// Points 是扁平 [x,y,x,y,...];至少 3 个点(6 个数)才是面。
+		// #23 扁平坐标必须**成对**。奇数长度=数据损坏,旧代码 `for i+1<len` 会静默丢掉
+		// 最后一个孤值、把剩下的当一个"少一维"的多边形照常导出。宁可报错也不产错区域。
+		if len(kf.Points)%2 != 0 {
+			return nil, false, fmt.Errorf("track %d 的 polygon 坐标数为奇数(%d),数据损坏", t.TrackID, len(kf.Points))
+		}
+		// 至少 3 个点(6 个数)才是面;不足则跳过(与 bbox<4 同处理,属"几何不足"非损坏)。
 		if len(kf.Points) < 6 {
-			return nil, false
+			return nil, false, nil
 		}
 		ring := make([][]float64, 0, len(kf.Points)/2+1)
 		for i := 0; i+1 < len(kf.Points); i += 2 {
-			ring = append(ring, []float64{kf.Points[i], kf.Points[i+1]})
+			x, y := kf.Points[i], kf.Points[i+1]
+			if math.IsNaN(x) || math.IsInf(x, 0) || math.IsNaN(y) || math.IsInf(y, 0) {
+				return nil, false, fmt.Errorf("track %d 的 polygon 含非有限坐标", t.TrackID)
+			}
+			ring = append(ring, []float64{x, y})
 		}
-		return closeRing(ring), true
+		return closeRing(ring), true, nil
 	case paymodel.TrackKindCells:
 		// cells(病理 C2)是**检测/实例分割**,不是区域多边形——这份 GeoJSON 只导
 		// 区域(C1.4)。cells 有意跳过,等 C2.4 走专用的 detection 导出(COCO detection /
 		// QuPath objectType=detection,每实例 bbox-local RLE 按各自 bbox 平移回全图)。
 		// 显式列出而非落进 default,免得日后当成漏导的 bug(#6 稀疏几何静默丢弃那类)。
-		return nil, false
+		return nil, false, nil
 	default:
-		return nil, false
+		return nil, false, nil
 	}
 }
 

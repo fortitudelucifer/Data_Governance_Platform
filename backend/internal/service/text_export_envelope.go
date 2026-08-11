@@ -44,6 +44,7 @@ func buildTextEnvelope(doc paymodel.Document, meta exportEnvelopeMeta, resolveUs
 		"id":             doc.DocKey,
 		"rid":            []string{},
 		"content":        resolveContent(doc.Data),
+		"content_fields": allContentFields(doc.Data), // #16 span.field 可指向非 primary 字段,一并带出
 		"label_info":     labelInfo,
 		"original_time":  nil,
 		"modified_time":  formatExportTime(doc.UpdatedAt.Time),
@@ -59,7 +60,9 @@ func buildTextEnvelope(doc paymodel.Document, meta exportEnvelopeMeta, resolveUs
 // buildLabelInfo assembles label_info (annotations + provenance + review state)
 // and the generated_flag summary from the document's QA pairs.
 func buildLabelInfo(doc paymodel.Document, resolveUser func(uint) string) (map[string]interface{}, map[string]interface{}) {
-	pairs := paymodel.ParseQAPairs(doc.Data["qa_pairs"])
+	// #17 导出用**无损**解码器,不跑生成阶段的清洗(否则短问题/重复问题被静默删掉,
+	// 正式 QA 里人工加的记录凭空消失)。按存储顺序原样携带。
+	pairs := paymodel.DecodeQAPairs(doc.Data["qa_pairs"])
 
 	cleanPairs := make([]map[string]interface{}, 0, len(pairs))
 	modelsSet := map[string]struct{}{}
@@ -106,7 +109,12 @@ func buildLabelInfo(doc paymodel.Document, resolveUser func(uint) string) (map[s
 		}
 		cleanPairs = append(cleanPairs, cp)
 
-		switch classifySource(p.Source) {
+		// #18 交叉校验:带模型运行 ID/Model 的一定是模型产出,不管 source 字符串怎么写。
+		cls := classifySource(p.Source)
+		if cls != "model" && strings.TrimSpace(p.Model) != "" {
+			cls = "model"
+		}
+		switch cls {
 		case "model":
 			hasModel = true
 		case "rule":
@@ -155,6 +163,24 @@ func buildLabelInfo(doc paymodel.Document, resolveUser func(uint) string) (map[s
 	return labelInfo, gen
 }
 
+// allContentFields returns every non-empty known text field present on the doc
+// (#16). The envelope's top-level `content` is only the *primary* field, but a
+// span may anchor to another one (e.g. an annotator selected on `full_text` while
+// the primary is the short `text`). Without carrying the other fields, that span's
+// start/end offsets point into text the export doesn't contain — unresolvable
+// downstream. Export all of them so every span.field can be resolved.
+func allContentFields(data map[string]interface{}) map[string]interface{} {
+	out := map[string]interface{}{}
+	for _, f := range contentFieldOrder {
+		if v, ok := data[f]; ok {
+			if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+				out[f] = s
+			}
+		}
+	}
+	return out
+}
+
 // resolveContent picks the primary text body, matching the workbench order and
 // falling back to the longest string field.
 func resolveContent(data map[string]interface{}) interface{} {
@@ -192,17 +218,26 @@ func buildSourceDetail(base map[string]interface{}, data map[string]interface{})
 }
 
 // classifySource normalises a QA-pair source into model / rule / human / other.
+//
+// #18 采纳的模型结果 source 是 `llm_candidate` / `llm_judge` / `llm_judge_suggestion`
+// 这类**带前缀**的值(text_candidate 采纳时写的)。旧的精确匹配漏掉它们 → 归 other →
+// generated=false、methods 缺 model —— 直接破坏"这条是不是模型产出"的数据来源审计
+// (医学场景尤其致命)。生产与导出必须共用同一套判据:精确枚举 + llm/ai/model 前缀兜底。
 func classifySource(source string) string {
-	switch strings.ToLower(strings.TrimSpace(source)) {
-	case "ai", "model", "llm", "auto", "machine", "generated":
+	s := strings.ToLower(strings.TrimSpace(source))
+	switch s {
+	case "ai", "model", "llm", "auto", "machine", "generated",
+		"llm_candidate", "llm_judge", "llm_judge_suggestion":
 		return "model"
 	case "rule", "regex", "template":
 		return "rule"
 	case "manual", "human", "annotator", "edited":
 		return "human"
-	default:
-		return "other"
 	}
+	if strings.HasPrefix(s, "llm") || strings.HasPrefix(s, "model") || strings.HasPrefix(s, "gpt") {
+		return "model"
+	}
+	return "other"
 }
 
 func annotatorType(hasModel, hasRule, hasManual bool) string {

@@ -24,6 +24,16 @@ func ParseQAPairs(data interface{}) []QAPair {
 	return filterQAPairs(extractQAPairs(data))
 }
 
+// DecodeQAPairs is the **lossless** decoder for **persisted** QA records: it
+// converts the stored form to []QAPair **without** the generation-stage filter
+// (no <5-rune drop, no dedup) (#17). ParseQAPairs is a *生成结果清洗器* meant for
+// raw model output; running it on the export path silently deletes valid human
+// records — an annotator's "诊断？"(3 字) was accepted on write, then vanished on
+// export. Export/audit must carry the stored records in stored order, verbatim.
+func DecodeQAPairs(data interface{}) []QAPair {
+	return extractQAPairs(data)
+}
+
 // extractQAPairs converts any supported raw form to an unfiltered []QAPair.
 func extractQAPairs(data interface{}) []QAPair {
 	if data == nil {

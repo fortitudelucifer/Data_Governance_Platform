@@ -164,7 +164,13 @@ func registerLLMRoutes(g *gin.RouterGroup, deps Deps) {
 }
 
 func registerExportRoutes(g *gin.RouterGroup, deps Deps) {
-	g.GET("/datasets/:id/export", deps.ExportHandler.ExportDataset)
+	// #1 文本导出必须过 reviewer/admin 门禁——与多模态导出(final-annotations.jsonl /
+	// export.coco 等都挂 rolesReview)对齐。之前这条裸挂,任何持有效 JWT 的 annotator
+	// 直接 GET 就能下载整套活跃文本(前端只给 reviewer 显示按钮**不是**安全边界)。
+	// 文本线用 admin/reviewer/image_reviewer(与文本文档管理路由同一组角色)。
+	g.GET("/datasets/:id/export",
+		middleware.RequireRole("admin", "reviewer", "image_reviewer"),
+		deps.ExportHandler.ExportDataset)
 	g.GET("/export/formats", deps.ExportHandler.ListExportFormats)
 }
 

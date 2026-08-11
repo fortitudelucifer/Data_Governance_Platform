@@ -44,13 +44,17 @@ func (h *AudioExportHandler) ExportAudio(c *gin.Context) {
 		Error(c, http.StatusBadRequest, "format must be one of webvtt|srt|rttm|csv|jsonl")
 		return
 	}
-	taskIDs := parseTaskIDs(c)
+	taskIDs, err := parseTaskIDs(c)
+	if err != nil {
+		Error(c, http.StatusBadRequest, err.Error())
+		return
+	}
 	ctx := c.Request.Context()
 
 	if h.audioExport.IsPerFile(format) {
 		files, ferr := h.audioExport.BuildZip(ctx, uint(id), taskIDs, format)
 		if ferr != nil {
-			Error(c, http.StatusInternalServerError, ferr.Error())
+			exportError(c, ferr)
 			return
 		}
 		fname := exportFilename(id, "audio-"+format+".zip", taskIDs)
@@ -72,7 +76,7 @@ func (h *AudioExportHandler) ExportAudio(c *gin.Context) {
 
 	suffix, contentType, content, serr := h.audioExport.BuildSingle(ctx, uint(id), taskIDs, format)
 	if serr != nil {
-		Error(c, http.StatusInternalServerError, serr.Error())
+		exportError(c, serr)
 		return
 	}
 	fname := exportFilename(id, suffix, taskIDs)

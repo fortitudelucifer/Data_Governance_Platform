@@ -55,7 +55,11 @@ func (h *ExportHandler) ExportDataset(c *gin.Context) {
 	if uc := middleware.GetUserContext(c); uc != nil {
 		userID = uc.UserID
 	}
-	docKeys := parseDocKeys(c.Query("doc_keys"))
+	docKeys, err := parseDocKeys(c.Query("doc_keys"))
+	if err != nil {
+		Error(c, http.StatusBadRequest, err.Error())
+		return
+	}
 	stage := strings.TrimSpace(c.Query("stage"))
 
 	// Determine content type and file extension based on format
@@ -89,24 +93,27 @@ func (h *ExportHandler) ExportDataset(c *gin.Context) {
 	}
 }
 
-func parseDocKeys(raw string) []string {
+// parseDocKeys reads ?doc_keys=a,b,c. #2 fail-**closed**:参数出现但含空项 → error
+// (上层 400)。空项被静默丢弃后剩空 slice,下游当"无筛选"导出整集——同 task_ids 的
+// fail-open 陷阱。重复项去重是幂等的(不改变选择语义),保留;空项则是坏参数,拒绝。
+func parseDocKeys(raw string) ([]string, error) {
 	if raw == "" {
-		return nil
+		return nil, nil // 未提供 = 无筛选
 	}
 	seen := make(map[string]struct{})
 	keys := make([]string, 0)
 	for _, part := range strings.Split(raw, ",") {
 		key := strings.TrimSpace(part)
 		if key == "" {
-			continue
+			return nil, fmt.Errorf("doc_keys 含空项(如尾随逗号)：%q", raw)
 		}
 		if _, ok := seen[key]; ok {
-			continue
+			continue // 重复去重(幂等,不改选择语义)
 		}
 		seen[key] = struct{}{}
 		keys = append(keys, key)
 	}
-	return keys
+	return keys, nil
 }
 
 // ListExportFormats handles GET /export/formats.
