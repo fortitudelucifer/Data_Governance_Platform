@@ -316,7 +316,12 @@ func (w *MediaWorker) putDerivative(ctx context.Context, a *dbmodel.Asset, kind,
 		Status:     "ready",
 		SizeBytes:  int64(len(body)),
 	}
-	return w.db.UpsertDerivative(ctx, d)
+	if err := w.db.UpsertDerivative(ctx, d); err != nil {
+		// #15 派生物 blob 已写、DB 行 upsert 失败 → blob 孤儿。登记 GC outbox(best-effort)。
+		_ = w.db.EnqueueObjectGC(ctx, []dbmodel.ObjectGC{{StorageURI: res.StorageURI, Reason: "orphan: derivative upsert failed"}})
+		return err
+	}
+	return nil
 }
 
 // putDerivativeFile streams a derived file (e.g. a transcoded MP4, too large to
@@ -345,7 +350,12 @@ func (w *MediaWorker) putDerivativeFile(ctx context.Context, a *dbmodel.Asset, k
 		Status:     "ready",
 		SizeBytes:  st.Size(),
 	}
-	return w.db.UpsertDerivative(ctx, d)
+	if err := w.db.UpsertDerivative(ctx, d); err != nil {
+		// #15 派生物 blob 已写、DB 行 upsert 失败 → blob 孤儿。登记 GC outbox(best-effort)。
+		_ = w.db.EnqueueObjectGC(ctx, []dbmodel.ObjectGC{{StorageURI: res.StorageURI, Reason: "orphan: derivative upsert failed"}})
+		return err
+	}
+	return nil
 }
 
 // fetchToTemp streams the asset bytes to a temp file and returns its path.

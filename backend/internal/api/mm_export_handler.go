@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -66,15 +67,18 @@ func (h *ImageExportHandler) ExportDatasetFinalAnnotations(c *gin.Context) {
 		return
 	}
 	fname := exportFilename(id, "final.jsonl", taskIDs)
-	c.Header("Content-Type", "application/x-ndjson; charset=utf-8")
-	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, fname))
-	enc := json.NewEncoder(c.Writer)
-	enc.SetEscapeHTML(false)
-	_, err = h.payload.StreamFinalAnnotationsByDataset(c.Request.Context(), uint(id), since, taskIDs, func(fa *paymodel.FinalAnnotation) error {
-		return enc.Encode(fa)
-	})
-	if err != nil {
-		_ = enc.Encode(map[string]interface{}{"_export_error": err.Error()})
+	// #21 生成到临时文件 + checksum,成功才回传。旧代码流式直写 c.Writer,中途出错就
+	// 往 ndjson 里塞一条 {"_export_error":...} 记录再返回 200——业务 schema 被污染、下游
+	// 无从分辨完整与否。改成:失败零字节送出 → 干净的 500。
+	if err := serveGeneratedArtifact(c, fname, "application/x-ndjson; charset=utf-8", func(w io.Writer) error {
+		enc := json.NewEncoder(w)
+		enc.SetEscapeHTML(false)
+		_, e := h.payload.StreamFinalAnnotationsByDataset(c.Request.Context(), uint(id), since, taskIDs, func(fa *paymodel.FinalAnnotation) error {
+			return enc.Encode(fa)
+		})
+		return e
+	}); err != nil {
+		Error(c, http.StatusInternalServerError, err.Error())
 	}
 }
 
@@ -157,23 +161,30 @@ func (h *ImageExportHandler) ExportYOLOSeg(c *gin.Context) {
 		return
 	}
 	fname := exportFilename(id, "yolo-seg.zip", taskIDs)
-	c.Header("Content-Type", "application/zip")
-	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, fname))
-	zw := zip.NewWriter(c.Writer)
-	defer zw.Close()
-	writeZipEntry := func(name, content string) error {
-		w, werr := zw.Create(name)
-		if werr != nil {
+	// #21 zip 生成到临时文件 + checksum,成功才回传。旧代码把 zip 直写 c.Writer,某个
+	// 条目写失败时(header 已发)只能 return,留下**截断的 zip 却是 200**,下游解压报错
+	// 却不知是传输问题还是数据问题。现在失败零字节送出 → 干净 500;成功带 X-Content-SHA256。
+	if err := serveGeneratedArtifact(c, fname, "application/zip", func(out io.Writer) error {
+		zw := zip.NewWriter(out)
+		writeZipEntry := func(name, content string) error {
+			w, werr := zw.Create(name)
+			if werr != nil {
+				return werr
+			}
+			_, werr = w.Write([]byte(content))
 			return werr
 		}
-		_, werr = w.Write([]byte(content))
-		return werr
-	}
-	_ = writeZipEntry("data.yaml", exp.DataYAML)
-	for name, content := range exp.Files {
-		if err := writeZipEntry(name, content); err != nil {
-			return
+		if e := writeZipEntry("data.yaml", exp.DataYAML); e != nil {
+			return e
 		}
+		for name, content := range exp.Files {
+			if e := writeZipEntry(name, content); e != nil {
+				return e
+			}
+		}
+		return zw.Close() // #21 Close 错误必检:zip 中央目录在 Close 时写,吞掉=损坏包
+	}); err != nil {
+		exportError(c, err)
 	}
 }
 

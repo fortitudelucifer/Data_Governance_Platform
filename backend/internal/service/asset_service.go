@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -87,55 +88,78 @@ func (s *AssetService) DeleteAsset(ctx context.Context, id uint) error {
 	if err != nil {
 		return fmt.Errorf("find tasks: %w", err)
 	}
-	// 载荷行(标注/track/快照/AI 结果)。曾经是可选注入的清理(nil 就跳过
-	// ——一个静默漏清的口子);现在载荷与资产同库,无条件清,外键级联再兜一层。
-	if err := s.db.DeleteMultiModalByAsset(ctx, id, taskIDs); err != nil {
-		return fmt.Errorf("payload cleanup: %w", err)
-	}
-	// #16 源 blob 按**精确 storage_uri** 引用计数(不是全局 SHA)。源键含 dataset id,
-	// 同字节跨数据集是不同 URI;全局 SHA 会漏删自己的 blob、或被空 URI 的 QC_FAILED 行挡住。
-	// **查询出错必须中止删除**——宁可不删也不能瞎猜(猜错就是删掉别人还在用的 blob)。
-	sharedSource := false
-	if asset.StorageURI != "" {
-		n, e := s.db.CountAssetsByStorageURIExcept(ctx, asset.StorageURI, id)
-		if e != nil {
-			return fmt.Errorf("source blob refcount: %w", e)
+
+	// #15/#17 关系删除 + "该删哪些 blob" 登记进 GC outbox **放进同一个数据库事务**。
+	// 提交 = 关系行没了 + 待删对象已持久登记,两者原子。旧代码是 "逐步删关系 + 内存里
+	// best-effort store.Delete":删一半崩溃 / 对象存储一抖 → blob 成 PHI 孤儿,无从回收。
+	// 现在删对象失败只是"outbox 里等 janitor 重试",不再泄漏。
+	var gcItems []dbmodel.ObjectGC
+	err = s.db.DB.Transaction(func(tx *gorm.DB) error {
+		// #20 与上传 dedup 决策串行化:拿 (dataset,sha) advisory 锁,并发上传若正持锁读
+		// existing,本删除会阻塞到它提交——上传于是不会返回一个"正被删"的幽灵 id。
+		if e := s.db.AcquireDedupUploadLockTx(ctx, tx, asset.DatasetID, asset.SHA256); e != nil {
+			return fmt.Errorf("dedup lock: %w", e)
 		}
-		sharedSource = n > 0
-	}
-	// 派生物 blob 是**本资产专属**(路径含 dataset/asset/kind,不跨资产共享)→ 无条件删,
-	// 不受源 SHA 是否共享影响(旧代码源 SHA 一共享就连本资产的派生物一起漏删)。#18:前缀
-	// 型派生物(volume_slices/ 等,URI 以 / 结尾)必须 DeletePrefix 删整棵子树,单对象 Delete
-	// 删不掉目录里的 PNG,整卷切片会永久残留。
-	if derivs, e := s.db.ListDerivatives(ctx, id); e == nil {
+		txRepo := s.db.WithTx(tx)
+		// #16 源 blob 按**精确 storage_uri**(不是全局 SHA)计数;在事务内算,与删除一致。
+		// 查询出错必须中止(宁可不删也不猜)。派生物是本资产专属,无条件删。
+		sharedSource := false
+		if asset.StorageURI != "" {
+			n, e := txRepo.CountAssetsByStorageURIExcept(ctx, asset.StorageURI, id)
+			if e != nil {
+				return fmt.Errorf("source blob refcount: %w", e)
+			}
+			sharedSource = n > 0
+		}
+		derivs, e := txRepo.ListDerivatives(ctx, id)
+		if e != nil {
+			return fmt.Errorf("list derivatives: %w", e)
+		}
+		if e := txRepo.DeleteMultiModalByAsset(ctx, id, taskIDs); e != nil {
+			return fmt.Errorf("payload cleanup: %w", e)
+		}
+		if e := txRepo.DeleteDerivativesByAsset(ctx, id); e != nil {
+			return fmt.Errorf("delete derivatives: %w", e)
+		}
+		if e := txRepo.DeleteAnnotationTasksByAsset(ctx, id); e != nil {
+			return fmt.Errorf("delete tasks: %w", e)
+		}
+		if e := txRepo.DeleteAsset(ctx, id); e != nil {
+			return fmt.Errorf("delete asset row: %w", e)
+		}
+		// 派生物(含 #18 前缀型 volume_slices/)+ 未共享的源 blob 入队。
 		for _, d := range derivs {
 			if d.StorageURI == "" {
 				continue
 			}
-			if strings.HasSuffix(d.StorageURI, "/") {
-				_ = s.store.DeletePrefix(ctx, d.StorageURI) // #18 前缀:删整棵
-			} else {
-				_ = s.store.Delete(ctx, d.StorageURI)
-			}
+			gcItems = append(gcItems, dbmodel.ObjectGC{
+				StorageURI: d.StorageURI, IsPrefix: strings.HasSuffix(d.StorageURI, "/"),
+				Reason: "delete asset derivative",
+			})
+		}
+		if !sharedSource && asset.StorageURI != "" {
+			gcItems = append(gcItems, dbmodel.ObjectGC{StorageURI: asset.StorageURI, Reason: "delete asset source"})
+		}
+		return s.db.EnqueueObjectGCTx(ctx, tx, gcItems)
+	})
+	if err != nil {
+		return fmt.Errorf("delete asset: %w", err)
+	}
+
+	// 提交后走快路径:立刻尝试删对象;成功就顺手把 outbox 行消掉,失败留给 janitor 重试。
+	// (Delete/DeletePrefix 幂等,janitor 再来发现已删也会 resolve。)
+	for _, it := range gcItems {
+		var de error
+		if it.IsPrefix {
+			de = s.store.DeletePrefix(ctx, it.StorageURI)
+		} else {
+			de = s.store.Delete(ctx, it.StorageURI)
+		}
+		if de == nil && it.ID != 0 {
+			_ = s.db.ResolveObjectGC(ctx, it.ID)
 		}
 	}
-	if err := s.db.DeleteDerivativesByAsset(ctx, id); err != nil {
-		return fmt.Errorf("delete derivatives: %w", err)
-	}
-	// Annotation tasks.
-	if err := s.db.DeleteAnnotationTasksByAsset(ctx, id); err != nil {
-		return fmt.Errorf("delete tasks: %w", err)
-	}
-	// Source blob (guarded by exact-URI refcount).
-	if !sharedSource && asset.StorageURI != "" {
-		_ = s.store.Delete(ctx, asset.StorageURI) // best-effort (may be locked mid-preprocess)
-	}
-	// Asset row last.
-	if err := s.db.DeleteAsset(ctx, id); err != nil {
-		return fmt.Errorf("delete asset row: %w", err)
-	}
-	// #13 缓存失效放在**删行之后**——旧代码先清缓存再删行,并发 GET 会把即将删除的
-	// 资产重新填回缓存,留下一个"库里没有、缓存有"的幽灵。提交后再清一次,窗口最小化。
+	// #13 缓存失效放在**删行之后**,避免并发 GET 把即将删除的资产重新填回缓存。
 	if s.cache != nil {
 		s.cache.Delete(ctx, "asset:"+strconv.FormatUint(uint64(id), 10))
 	}
@@ -227,12 +251,14 @@ func (s *AssetService) UploadImage(ctx context.Context, body io.Reader, opts Upl
 	// 这次查询只是省一次对象存储写入的快路径；**正确性由数据库唯一约束保证**
 	// （见下方 CreateAssetDedup，M6）——快路径漏掉的并发窗口由约束兜底。
 	if report.Status == qcPassed && report.SHA256 != "" {
-		existing, err := s.db.FindAssetBySHA256(ctx, opts.DatasetID, report.SHA256)
-		if err == nil && existing != nil {
-			return &UploadResult{Asset: existing, Report: report, Deduplicated: true}, nil
+		// #20 dedup 读放进持 (dataset,sha) advisory 锁的事务里:并发 DeleteAsset 拿同一把锁,
+		// 无法在本次读期间**删完**,所以这里返回的 existing 不会是一个正被删的幽灵 id。
+		existing, derr := s.lockedDedupLookup(ctx, opts.DatasetID, report.SHA256)
+		if derr != nil {
+			return nil, fmt.Errorf("dedup lookup: %w", derr)
 		}
-		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, fmt.Errorf("dedup lookup: %w", err)
+		if existing != nil {
+			return s.dedupHit(ctx, existing, report), nil
 		}
 	}
 
@@ -295,6 +321,11 @@ func (s *AssetService) UploadImage(ctx context.Context, body io.Reader, opts Upl
 	// 落在同一个键上，无需回滚。
 	inserted, err := s.db.CreateAssetDedup(ctx, asset)
 	if err != nil {
+		// #15 对象已写、资产行插入失败 → blob 成孤儿(可能是 PHI)。登记进 GC outbox
+		// 让 janitor 回收(best-effort;插入失败多是约束/瞬时,DB 通常还在)。
+		if asset.StorageURI != "" {
+			_ = s.db.EnqueueObjectGC(ctx, []dbmodel.ObjectGC{{StorageURI: asset.StorageURI, Reason: "orphan: asset insert failed"}})
+		}
 		return nil, fmt.Errorf("create asset row: %w", err)
 	}
 	if !inserted {
@@ -302,18 +333,71 @@ func (s *AssetService) UploadImage(ctx context.Context, body io.Reader, opts Upl
 		if ferr != nil || existing == nil {
 			return nil, fmt.Errorf("dedup conflict but existing row unreadable: %w", ferr)
 		}
-		return &UploadResult{Asset: existing, Report: report, Deduplicated: true}, nil
+		return s.dedupHit(ctx, existing, report), nil
 	}
 
 	res := &UploadResult{Asset: asset, Report: report, Deduplicated: false}
-	// QC 通过即建标注任务：图片走 L1 路由进 AI；音频/视频在任务服务里直接进
-	// HUMAN_PENDING（不走图片 L1 router）。详见 plan_v2 执行方案-00 T0.1。
-	if s.tasks != nil && asset.QCStatus == dbmodel.QCStatusPassed {
-		if task, err := s.tasks.CreateForAsset(ctx, asset, CreateTaskOptions{}); err == nil {
-			res.Task = task
-		}
+	// #14 QC 通过即建标注任务,且**不吞错**。旧代码 `if err == nil` 把任务创建失败静默
+	// 丢掉,返回成功 → 资产存在却没有任务、永远无法被标注,重传走 dedup 又不补 → 永久
+	// 无任务资产。ensureTaskForAsset 幂等(先查后建),失败大声记日志(资产已在,任务可
+	// 在下次 dedup 命中时补上,见下方两处),而不是假装成功。
+	if task, err := s.ensureTaskForAsset(ctx, asset); err != nil {
+		slog.Error("ensure task for asset failed (asset persisted, task will be retried on re-upload)", "asset_id", asset.ID, "error", err)
+	} else {
+		res.Task = task
 	}
 	return res, nil
+}
+
+// lockedDedupLookup reads the existing asset for (datasetID, sha) while holding the
+// per-content advisory lock (#20), so a concurrent DeleteAsset can't finish during
+// the read. Returns (nil, nil) when no live asset exists → caller falls through to
+// the normal insert path (whose unique constraint is the real correctness backstop).
+func (s *AssetService) lockedDedupLookup(ctx context.Context, datasetID uint, sha string) (*dbmodel.Asset, error) {
+	var existing *dbmodel.Asset
+	err := s.db.DB.Transaction(func(tx *gorm.DB) error {
+		if e := s.db.AcquireDedupUploadLockTx(ctx, tx, datasetID, sha); e != nil {
+			return e
+		}
+		ex, e := s.db.WithTx(tx).FindAssetBySHA256(ctx, datasetID, sha)
+		if e != nil && !errors.Is(e, gorm.ErrRecordNotFound) {
+			return e
+		}
+		existing = ex
+		return nil
+	})
+	return existing, err
+}
+
+// dedupHit builds a dedup UploadResult, **ensuring the deduped asset has a task**
+// first (#14 self-heal): if the very first upload's task creation failed, the
+// asset would otherwise stay task-less forever because re-uploads just short-circuit
+// to dedup. report may be nil (RegisterAsset path carries no QC report).
+func (s *AssetService) dedupHit(ctx context.Context, existing *dbmodel.Asset, report *QCReport) *UploadResult {
+	if _, err := s.ensureTaskForAsset(ctx, existing); err != nil {
+		slog.Error("ensure task on dedup-hit failed", "asset_id", existing.ID, "error", err)
+	}
+	return &UploadResult{Asset: existing, Report: report, Deduplicated: true}
+}
+
+// ensureTaskForAsset creates the initial annotation task for a QC-passed asset if
+// it doesn't already have one (#14). **Idempotent** — safe to call on both the
+// fresh upload and every dedup-hit, so a task-creation failure on the first upload
+// is repaired on any later re-upload of the same content instead of leaving a
+// permanently task-less asset. Returns (nil, nil) when tasks are disabled, the QC
+// failed, or a task already exists.
+func (s *AssetService) ensureTaskForAsset(ctx context.Context, asset *dbmodel.Asset) (*dbmodel.AnnotationTask, error) {
+	if s.tasks == nil || asset == nil || asset.QCStatus != dbmodel.QCStatusPassed {
+		return nil, nil
+	}
+	existing, err := s.db.FindAnnotationTaskIDsByAsset(ctx, asset.ID)
+	if err != nil {
+		return nil, err
+	}
+	if len(existing) > 0 {
+		return nil, nil // 已有任务:幂等,不再建
+	}
+	return s.tasks.CreateForAsset(ctx, asset, CreateTaskOptions{})
 }
 
 // GetAsset returns the asset row by id, caching under "asset:{id}" for
@@ -425,12 +509,12 @@ func (s *AssetService) RegisterAsset(ctx context.Context, opts RegisterAssetOpts
 		}
 	}
 	if opts.SHA256 != "" {
-		existing, err := s.db.FindAssetBySHA256(ctx, opts.DatasetID, opts.SHA256)
-		if err == nil && existing != nil {
-			return &UploadResult{Asset: existing, Deduplicated: true}, nil
+		existing, derr := s.lockedDedupLookup(ctx, opts.DatasetID, opts.SHA256) // #20 见 UploadImage
+		if derr != nil {
+			return nil, fmt.Errorf("dedup lookup: %w", derr)
 		}
-		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, fmt.Errorf("dedup lookup: %w", err)
+		if existing != nil {
+			return s.dedupHit(ctx, existing, nil), nil
 		}
 	}
 	asset := &dbmodel.Asset{
@@ -450,6 +534,11 @@ func (s *AssetService) RegisterAsset(ctx context.Context, opts RegisterAssetOpts
 	// 与 UploadImage 同款（M6）：并发注册同一内容时由唯一约束兜底，输家取现存行。
 	inserted, err := s.db.CreateAssetDedup(ctx, asset)
 	if err != nil {
+		// #15 对象已写、资产行插入失败 → blob 成孤儿(可能是 PHI)。登记进 GC outbox
+		// 让 janitor 回收(best-effort;插入失败多是约束/瞬时,DB 通常还在)。
+		if asset.StorageURI != "" {
+			_ = s.db.EnqueueObjectGC(ctx, []dbmodel.ObjectGC{{StorageURI: asset.StorageURI, Reason: "orphan: asset insert failed"}})
+		}
 		return nil, fmt.Errorf("create asset row: %w", err)
 	}
 	if !inserted {
@@ -457,7 +546,7 @@ func (s *AssetService) RegisterAsset(ctx context.Context, opts RegisterAssetOpts
 		if ferr != nil || existing == nil {
 			return nil, fmt.Errorf("dedup conflict but existing row unreadable: %w", ferr)
 		}
-		return &UploadResult{Asset: existing, Deduplicated: true}, nil
+		return s.dedupHit(ctx, existing, nil), nil
 	}
 	res := &UploadResult{Asset: asset}
 	if s.tasks != nil {

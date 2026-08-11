@@ -3,6 +3,7 @@ package api
 import (
 	"archive/zip"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 
@@ -58,18 +59,21 @@ func (h *AudioExportHandler) ExportAudio(c *gin.Context) {
 			return
 		}
 		fname := exportFilename(id, "audio-"+format+".zip", taskIDs)
-		c.Header("Content-Type", "application/zip")
-		c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, fname))
-		zw := zip.NewWriter(c.Writer)
-		defer zw.Close()
-		for name, content := range files {
-			w, werr := zw.Create(name)
-			if werr != nil {
-				return
+		// #21 生成到临时文件 + checksum,成功才回传(失败零字节 → 干净错误,不留截断 zip)。
+		if err := serveGeneratedArtifact(c, fname, "application/zip", func(out io.Writer) error {
+			zw := zip.NewWriter(out)
+			for name, content := range files {
+				w, werr := zw.Create(name)
+				if werr != nil {
+					return werr
+				}
+				if _, werr = w.Write([]byte(content)); werr != nil {
+					return werr
+				}
 			}
-			if _, werr = w.Write([]byte(content)); werr != nil {
-				return
-			}
+			return zw.Close() // 中央目录在 Close 写,错误必检
+		}); err != nil {
+			exportError(c, err)
 		}
 		return
 	}

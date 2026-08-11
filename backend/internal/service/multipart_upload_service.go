@@ -294,7 +294,15 @@ func (s *MultipartUploadService) Abort(ctx context.Context, userID uint, session
 	}
 	if s.store != nil {
 		_ = s.store.AbortMultipart(ctx, sess.TempObjectKey, sess.UploadID)
-		_ = s.store.DeleteKey(ctx, sess.TempObjectKey)
+		if err := s.store.DeleteKey(ctx, sess.TempObjectKey); err != nil {
+			// #4 温对象没删掉 → 不落 aborted(终态、不再回收);标 failed + expires_at=now,
+			// janitor 下一轮立刻重试清理。用户视角会话已取消(不会完成),清理在后台兜底。
+			_ = s.db.UpdateUploadSession(ctx, sessionID, map[string]interface{}{
+				"status": dbmodel.UploadFailed, "error": "abort temp cleanup failed: " + err.Error(),
+				"expires_at": time.Now(),
+			})
+			return nil
+		}
 	}
 	return s.db.UpdateUploadSession(ctx, sessionID, map[string]interface{}{"status": dbmodel.UploadAborted})
 }
@@ -317,19 +325,49 @@ func (s *MultipartUploadService) fail(ctx context.Context, sess *dbmodel.UploadS
 	_, _ = s.db.CASUploadSessionStatus(ctx, sess.SessionID, dbmodel.UploadCompleting, dbmodel.UploadFailed, map[string]interface{}{"error": msg})
 }
 
-// cleanupExpired aborts + removes a few overdue sessions (opportunistic janitor).
+// StartJanitor runs a **resident** cleanup loop (#4). The old cleanup was
+// opportunistic — only fired from Init, at most 5 rows — so if uploads stop, every
+// overdue session's parts + temp object leak forever. This drains on a timer,
+// independent of request traffic. Stop via ctx cancellation.
+func (s *MultipartUploadService) StartJanitor(ctx context.Context, interval time.Duration) {
+	if s.store == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				s.cleanupExpired(ctx)
+			}
+		}
+	}()
+}
+
+// cleanupExpired aborts + removes overdue sessions. **只有对象真的清干净了才把会话标
+// expired**(#4):旧代码 AbortMultipart/DeleteKey 失败也照标 expired,而 expired 不在
+// 可回收查询集里 → parts/temp 从此永久失联。现在清理失败就保持 pending/failed(可回收),
+// 下一轮再试;确认成功才落终态。
 func (s *MultipartUploadService) cleanupExpired(ctx context.Context) {
 	if s.store == nil {
 		return
 	}
-	sessions, err := s.db.ListReclaimableUploadSessions(ctx, time.Now(), 5)
+	sessions, err := s.db.ListReclaimableUploadSessions(ctx, time.Now(), 50)
 	if err != nil {
 		return
 	}
 	for i := range sessions {
 		ss := sessions[i]
-		_ = s.store.AbortMultipart(ctx, ss.TempObjectKey, ss.UploadID)
-		_ = s.store.DeleteKey(ctx, ss.TempObjectKey)
+		_ = s.store.AbortMultipart(ctx, ss.TempObjectKey, ss.UploadID) // best-effort:parts 可能已释放
+		if err := s.store.DeleteKey(ctx, ss.TempObjectKey); err != nil {
+			continue // 温对象没删掉 → 不标 expired,保持可回收,下轮重试(不再永久失联)
+		}
 		_ = s.db.UpdateUploadSession(ctx, ss.SessionID, map[string]interface{}{"status": dbmodel.UploadExpired})
 	}
 }

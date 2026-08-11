@@ -4,12 +4,33 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 
 	dbmodel "text-annotation-platform/internal/model/relational"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+// dedupAdvisoryKey derives a stable int64 advisory-lock key from (dataset_id, sha).
+func dedupAdvisoryKey(datasetID uint, sha string) int64 {
+	h := fnv.New64a()
+	_, _ = fmt.Fprintf(h, "%d:%s", datasetID, sha)
+	return int64(h.Sum64())
+}
+
+// AcquireDedupUploadLockTx takes a **transaction-scoped** Postgres advisory lock
+// keyed on (dataset_id, sha256) (#20). It is held until the tx commits/rolls back,
+// and serialises the upload dedup decision against DeleteAsset: a concurrent delete
+// (which takes the same lock) can't *complete* while an upload holds it to read the
+// existing row, so the upload never returns a dedup reference to an asset a delete
+// is removing (the "ghost id" race). No-op for an empty sha.
+func (r *DB) AcquireDedupUploadLockTx(ctx context.Context, tx *gorm.DB, datasetID uint, sha string) error {
+	if sha == "" {
+		return nil
+	}
+	return tx.WithContext(ctx).Exec("SELECT pg_advisory_xact_lock(?)", dedupAdvisoryKey(datasetID, sha)).Error
+}
 
 // CreateAsset inserts a new Asset row.
 func (r *DB) CreateAsset(ctx context.Context, asset *dbmodel.Asset) error {

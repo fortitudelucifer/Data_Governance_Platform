@@ -312,6 +312,11 @@ func main() {
 	mediaWorker := service.NewMediaWorker(mediaCfg, dbRepo, assetStore,
 		service.NewMediaTools(cfg.MultiModal.FFmpegPath, cfg.MultiModal.FFprobePath))
 
+	// 存储生命周期底座:对象 GC janitor 排空 durable outbox(migration 000005)——删除
+	// 路径把"该删哪些 blob"与删关系行同事务登记,这个常驻进程负责真正删对象并重试到成功,
+	// 于是"删一半崩溃 / 对象存储临时失败"从永久泄漏降级为自动重试(包6 #15/#17/#19 底座)。
+	objectGCWorker := service.NewObjectGCWorker(service.DefaultObjectGCConfig(), dbRepo, assetStore)
+
 	// Initialize plugin registries and register built-in plugins
 	plugin.InitRegistries()
 	registerBuiltinPlugins()
@@ -540,6 +545,12 @@ func main() {
 		log.Printf("[media_worker] disabled by configuration (MM_MEDIA_WORKER_ENABLED=false)")
 		_ = mediaWorker
 	}
+	// 对象 GC janitor:始终启动(assetStore 为 nil 时 Start 自动空转)。删除路径的
+	// 可靠补偿靠它排空 outbox。
+	objectGCWorker.Start(context.Background())
+	// #4 multipart 会话常驻 janitor:定时回收过期上传的 parts + 温对象(不再只在 Init
+	// 机会式清 5 条)。store 为 nil(无 MinIO)时自动空转。
+	multipartService.StartJanitor(context.Background(), time.Minute)
 
 	// Set up Gin router and register the full route surface via the shared
 	// internal/server package (see TD-16). The Deps struct bundles every

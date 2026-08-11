@@ -6,10 +6,14 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	paymodel "text-annotation-platform/internal/model/payload"
+	dbmodel "text-annotation-platform/internal/model/relational"
 	"text-annotation-platform/internal/repository"
+
+	"gorm.io/gorm"
 )
 
 // AuditLogger defines the interface for logging audit entries.
@@ -188,72 +192,90 @@ func (h *CompensationHandler) ImportWithCompensation(
 	}, nil
 }
 
-// DeleteDatasetWithCompensation deletes a dataset's documents first,
-// then removes the relational DB record. If document deletion fails, the rest is left
-// untouched. (07 之后同库,此补偿语义已退化为普通顺序删除;保留审计日志。)
+// gatherDatasetBlobs collects every object-store URI owned by a dataset's assets
+// (source blobs + derivatives) for GC-outbox enqueue (#19). Source keys are
+// dataset-scoped (KeyForContent embeds the dataset id) and deduped one-per-URI
+// within a dataset, so a dataset's blobs are never referenced by another dataset
+// — safe to enqueue all of them.
+func (h *CompensationHandler) gatherDatasetBlobs(ctx context.Context, datasetID uint) ([]dbmodel.ObjectGC, error) {
+	assetIDs, err := h.dbRepo.ListAssetIDsByDataset(ctx, datasetID)
+	if err != nil {
+		return nil, fmt.Errorf("list assets for dataset %d: %w", datasetID, err)
+	}
+	var items []dbmodel.ObjectGC
+	for _, aid := range assetIDs {
+		asset, err := h.dbRepo.FindAssetByID(ctx, aid)
+		if err != nil {
+			return nil, fmt.Errorf("load asset %d: %w", aid, err)
+		}
+		if asset != nil && asset.StorageURI != "" {
+			items = append(items, dbmodel.ObjectGC{StorageURI: asset.StorageURI, Reason: "delete dataset source"})
+		}
+		derivs, err := h.dbRepo.ListDerivatives(ctx, aid)
+		if err != nil {
+			return nil, fmt.Errorf("list derivatives of asset %d: %w", aid, err)
+		}
+		for _, d := range derivs {
+			if d.StorageURI == "" {
+				continue
+			}
+			items = append(items, dbmodel.ObjectGC{
+				StorageURI: d.StorageURI, IsPrefix: strings.HasSuffix(d.StorageURI, "/"),
+				Reason: "delete dataset derivative",
+			})
+		}
+	}
+	return items, nil
+}
+
+// DeleteDatasetWithCompensation deletes a dataset **atomically** (#19).
+//
+// 旧实现是"先独立删 documents、再逐资产提交、最后删数据集行"——三段独立提交,任何
+// 一段(第 3 个资产 / 最终 dataset DELETE)失败,前面已删的文档/资产不可恢复,数据集
+// 却还在 → 半残数据集。改成:所有关系行由**数据集行的 FK ON DELETE CASCADE 一次原子
+// 清掉**(assets/tasks/documents/payload 全挂在 datasets 上);对象存储 blob(不吃
+// cascade)先在**同事务**登记进 GC outbox,由常驻 janitor 删除并重试到成功。于是要么
+// 整个数据集连同 blob 都干净消失,要么什么都没动。
 func (h *CompensationHandler) DeleteDatasetWithCompensation(
 	ctx context.Context,
 	datasetID uint,
 ) error {
-	// Step 1: Delete documents
-	if err := h.docDB.DeleteDocumentsByDataset(ctx, datasetID); err != nil {
-		h.logEntry(ctx, AuditEntry{
-			Action:     "delete",
-			TargetType: "dataset",
-			TargetID:   fmt.Sprintf("%d", datasetID),
-			UserID:     1,
-			Result:     "failure",
-			Detail:     fmt.Sprintf("document delete failed: %v", err),
-		})
-		return fmt.Errorf("delete documents failed: %w", err)
-	}
-
-	// Step 1.5（M7）: per-asset cleanup — 对象存储 blob（内容哈希被其它资产共享时
-	// 跳过）、派生物 blob、载荷行(标注/track)。曾经这里什么都不做：删数据集只删
-	// 文本文档 + 数据集行，资产行 / blob / 任务全部泄漏（CLAUDE.md《已知坏》）。
-	// 顺序仍是「先载荷后关系行」（06 §6.1）：DeleteAsset 内部即如此。
-	// 资产**行**本身随后由数据集行的 FK ON DELETE CASCADE 一并消失。
-	if h.assets != nil {
-		assetIDs, err := h.dbRepo.ListAssetIDsByDataset(ctx, datasetID)
+	var gcItems []dbmodel.ObjectGC
+	if h.assets != nil { // runner(纯文本)模式没有资产栈,只删关系行(文档随 cascade 走)
+		items, err := h.gatherDatasetBlobs(ctx, datasetID)
 		if err != nil {
-			return fmt.Errorf("list assets for dataset %d: %w", datasetID, err)
+			h.logEntry(ctx, AuditEntry{
+				Action: "delete", TargetType: "dataset", TargetID: fmt.Sprintf("%d", datasetID),
+				UserID: 1, Result: "failure", Detail: fmt.Sprintf("gather blobs failed: %v", err),
+			})
+			return err
 		}
-		for _, id := range assetIDs {
-			if err := h.assets.DeleteAsset(ctx, id); err != nil && err != ErrAssetNotFound {
-				h.logEntry(ctx, AuditEntry{
-					Action: "delete", TargetType: "dataset", TargetID: fmt.Sprintf("%d", datasetID),
-					UserID: 1, Result: "failure",
-					Detail: fmt.Sprintf("asset %d cleanup failed: %v", id, err),
-				})
-				return fmt.Errorf("delete asset %d of dataset %d: %w", id, datasetID, err)
-			}
-		}
+		gcItems = items
 	}
 
-	// Step 2: Delete the relational record. 剩余的关系行（annotation_tasks /
-	// upload_sessions / batch_jobs / extraction_results / documents /
-	// dataset_tags…）由 FK ON DELETE CASCADE 级联清掉——级联是 schema 的属性，
-	// 不再依赖应用层记得（06 M7）。
-	if err := h.dbRepo.DeleteDataset(ctx, datasetID); err != nil {
+	// 一个事务:登记待删 blob(outbox)+ 删数据集行(cascade 清所有关系行)。
+	if err := h.dbRepo.DB.Transaction(func(tx *gorm.DB) error {
+		if err := h.dbRepo.EnqueueObjectGCTx(ctx, tx, gcItems); err != nil {
+			return err
+		}
+		return tx.WithContext(ctx).Exec("DELETE FROM datasets WHERE id = ?", datasetID).Error
+	}); err != nil {
 		h.logEntry(ctx, AuditEntry{
-			Action:     "delete",
-			TargetType: "dataset",
-			TargetID:   fmt.Sprintf("%d", datasetID),
-			UserID:     1,
-			Result:     "compensation_failed",
-			Detail:     fmt.Sprintf("dataset delete failed after document rows deleted: %v", err),
+			Action: "delete", TargetType: "dataset", TargetID: fmt.Sprintf("%d", datasetID),
+			UserID: 1, Result: "failure", Detail: fmt.Sprintf("atomic dataset delete failed: %v", err),
 		})
-		return fmt.Errorf("delete dataset failed (document rows already deleted): %w", err)
+		return fmt.Errorf("delete dataset %d: %w", datasetID, err)
 	}
 
-	// All succeeded
+	// 关系行已原子删除;blob 由 janitor 排空 outbox(重试到成功)。这里不做快路径,
+	// janitor 一个周期内即清完,删除不是即时关键路径。
 	h.logEntry(ctx, AuditEntry{
 		Action:     "delete",
 		TargetType: "dataset",
 		TargetID:   fmt.Sprintf("%d", datasetID),
 		UserID:     1,
 		Result:     "success",
-		Detail:     fmt.Sprintf("Dataset %d deleted successfully", datasetID),
+		Detail:     fmt.Sprintf("Dataset %d deleted atomically (%d blobs queued for GC)", datasetID, len(gcItems)),
 	})
 
 	return nil

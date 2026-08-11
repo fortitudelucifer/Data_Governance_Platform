@@ -56,18 +56,19 @@ func (h *VideoExportHandler) ExportVideo(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	if h.videoExport.IsPerFile(format) {
-		// Stream each file straight into the zip: MOT on long video expands to
-		// millions of rows and must never be buffered whole (B3.2).
+		// #21 生成到临时**文件**再回传:仍是恒定内存(磁盘不是 RAM,MOT 百万行不 OOM),
+		// 但中途出错时零字节送出 → 干净错误,而不是"截断的 zip 却是 200"。成功带 checksum。
 		fname := exportFilename(id, "video-"+format+".zip", taskIDs)
-		c.Header("Content-Type", "application/zip")
-		c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, fname))
-		zw := zip.NewWriter(c.Writer)
-		defer zw.Close()
-		if serr := h.videoExport.StreamZip(ctx, uint(id), taskIDs, format, func(name string) (io.Writer, error) {
-			return zw.Create(name)
-		}); serr != nil {
-			// Headers are already sent; the truncated zip signals the failure.
-			return
+		if err := serveGeneratedArtifact(c, fname, "application/zip", func(out io.Writer) error {
+			zw := zip.NewWriter(out)
+			if e := h.videoExport.StreamZip(ctx, uint(id), taskIDs, format, func(name string) (io.Writer, error) {
+				return zw.Create(name)
+			}); e != nil {
+				return e
+			}
+			return zw.Close() // 中央目录在 Close 写,错误必检
+		}); err != nil {
+			exportError(c, err)
 		}
 		return
 	}
