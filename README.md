@@ -9,6 +9,8 @@
 - **后端** `backend/` — Go 1.25 · Gin · GORM · **PostgreSQL** · Redis · MinIO
 - **前端** `frontend/` — React 19 · TypeScript · Vite · shadcn/ui · Zustand · TanStack Query
 
+**持续开发中** · [Roadmap：交付完善、可追溯导出与数据基础设施规划](ROADMAP.md)
+
 ---
 
 ## 架构
